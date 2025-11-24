@@ -4,31 +4,32 @@
 #![warn(clippy::all)]
 #![forbid(unsafe_code)]
 
-use aide::{
-    axum::ApiRouter,
-    openapi::{self, OpenApi},
-};
+use std::{borrow::Cow, sync::LazyLock, time::Duration};
 
-use crate::core::cache::Cache;
+use aide::axum::ApiRouter;
 use cfg::ConfigurationInner;
-use lazy_static::lazy_static;
-use opentelemetry::runtime::Tokio;
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{metrics::SdkMeterProvider, runtime::Tokio};
 use queue::TaskQueueProducer;
+use redis::RedisManager;
 use sea_orm::DatabaseConnection;
-use std::{
-    net::TcpListener,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+use sentry::integrations::tracing::EventFilter;
+use svix_ksuid::{KsuidLike, KsuidMs};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+use tower::layer::layer_fn;
+use tower_http::{
+    cors::{AllowHeaders, Any, CorsLayer},
+    normalize_path::NormalizePath,
 };
-use tower::ServiceBuilder;
-use tower_http::cors::{AllowHeaders, Any, CorsLayer};
-use tracing_subscriber::{prelude::*, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt as _, Layer as _};
 
 use crate::{
     cfg::{CacheBackend, Configuration},
     core::{
         cache,
+        cache::Cache,
         idempotency::IdempotencyService,
         operational_webhooks::{OperationalWebhookSender, OperationalWebhookSenderInner},
     },
@@ -42,6 +43,8 @@ pub mod core;
 pub mod db;
 pub mod error;
 pub mod expired_message_cleaner;
+pub mod metrics;
+pub mod openapi;
 pub mod queue;
 pub mod redis;
 pub mod v1;
@@ -49,9 +52,25 @@ pub mod worker;
 
 const CRATE_NAME: &str = env!("CARGO_CRATE_NAME");
 
-lazy_static! {
-    pub static ref SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static SHUTTING_DOWN_TOKEN: LazyLock<CancellationToken> = LazyLock::new(CancellationToken::new);
+
+/// Has someone requested shutdown?
+pub fn is_shutting_down() -> bool {
+    SHUTTING_DOWN_TOKEN.is_cancelled()
 }
+
+/// Request a CancellationToken for the application shut down
+pub fn shutting_down_token() -> CancellationToken {
+    SHUTTING_DOWN_TOKEN.clone()
+}
+
+/// Shut down the application
+pub fn start_shut_down() {
+    SHUTTING_DOWN_TOKEN.cancel();
+}
+
+pub static INSTANCE_ID: LazyLock<String> =
+    LazyLock::new(|| hex::encode(KsuidMs::new(None, None).to_string()));
 
 async fn graceful_shutdown_handler() {
     let ctrl_c = async {
@@ -77,117 +96,12 @@ async fn graceful_shutdown_handler() {
     }
 
     tracing::info!("Received shutdown signal. Shutting down gracefully...");
-    SHUTTING_DOWN.store(true, Ordering::SeqCst)
+    start_shut_down();
 }
 
-#[tracing::instrument(name = "app_start", level = "trace", skip_all)]
-pub async fn run(cfg: Configuration, listener: Option<TcpListener>) {
-    run_with_prefix(None, cfg, listener).await
-}
-
-pub fn initialize_openapi() -> OpenApi {
-    aide::gen::on_error(|error| {
-        tracing::error!("Aide generation error: {error}");
-    });
-    // Extract schemas to `#/components/schemas/` instead of using inline schemas.
-    aide::gen::extract_schemas(true);
-    // Have aide attempt to infer the `Content-Type` of responses based on the
-    // handlers' return types.
-    aide::gen::infer_responses(true);
-
-    aide::gen::in_context(|ctx| {
-        ctx.schema = schemars::gen::SchemaGenerator::new(
-            schemars::gen::SchemaSettings::draft07().with(|s| {
-                // HACK: These are set by the `extract_schemas` call above, but
-                // reinitializing the schema generator here means we are
-                // overwriting it. Hopefully, in the future we can set schema
-                // generator options without overwriting settings set by aide
-                // internally.
-                s.inline_subschemas = false;
-                s.definitions_path = "#/components/schemas/".into();
-
-                // Schemars generates an `anyOf` for `Option<T>` by default. This changes that
-                // to instead simply mark them as nullable.
-                s.option_nullable = true;
-                s.option_add_null_type = false;
-            }),
-        );
-    });
-
-    let tag_groups = serde_json::json![[
-        {
-            "name": "General",
-            "tags": ["Application", "Event Type"]
-        },
-        {
-            "name": "Application specific",
-            "tags": ["Authentication", "Endpoint", "Message", "Message Attempt", "Integration"]
-        },
-        {
-            "name": "Utility",
-            "tags": ["Health"]
-        },
-        {
-            "name": "Webhooks",
-            "tags": ["Webhooks"]
-        }
-    ]];
-
-    OpenApi {
-        info: openapi::Info {
-            title: "Svix API".to_owned(),
-            version: "1.4".to_owned(),
-            extensions: indexmap::indexmap! {
-                "x-logo".to_string() => serde_json::json!({
-                    "url": "https://www.svix.com/static/img/brand-padded.svg",
-                    "altText": "Svix Logo",
-                }),
-            },
-            ..Default::default()
-        },
-        tags: vec![
-            openapi::Tag {
-                name: "Application".to_owned(),
-                ..openapi::Tag::default()
-            },
-            openapi::Tag {
-                name: "Message".to_owned(),
-                ..openapi::Tag::default()
-            },
-            openapi::Tag {
-                name: "Message Attempt".to_owned(),
-                ..openapi::Tag::default()
-            },
-            openapi::Tag {
-                name: "Endpoint".to_owned(),
-                ..openapi::Tag::default()
-            },
-            openapi::Tag {
-                name: "Integration".to_owned(),
-                ..openapi::Tag::default()
-            },
-            openapi::Tag {
-                name: "Event Type".to_owned(),
-                ..openapi::Tag::default()
-            },
-            openapi::Tag {
-                name: "Authentication".to_owned(),
-                ..openapi::Tag::default()
-            },
-            openapi::Tag {
-                name: "Health".to_owned(),
-                ..openapi::Tag::default()
-            },
-            openapi::Tag {
-                name: "Webhooks".to_owned(),
-                ..openapi::Tag::default()
-            },
-        ],
-        extensions: indexmap::indexmap! {
-            "x-tagGroups".to_owned() => tag_groups,
-        },
-        ..Default::default()
-    }
+pub async fn run(cfg: Configuration) {
+    let _metrics = setup_metrics(&cfg);
+    run_with_prefix(cfg.queue_prefix.clone(), cfg, None).await
 }
 
 #[derive(Clone)]
@@ -211,15 +125,14 @@ pub async fn run_with_prefix(
     tracing::debug!("DB: Started");
 
     tracing::debug!("Cache: Initializing {:?}", cfg.cache_type);
-    let cache = match cfg.cache_backend() {
+    let cache_backend = cfg.cache_backend();
+    let cache = match &cache_backend {
         CacheBackend::None => cache::none::new(),
         CacheBackend::Memory => cache::memory::new(),
-        CacheBackend::Redis(dsn) => {
-            let mgr = crate::redis::new_redis_pool(dsn, &cfg).await;
-            cache::redis::new(mgr)
-        }
-        CacheBackend::RedisCluster(dsn) => {
-            let mgr = crate::redis::new_redis_pool_clustered(dsn, &cfg).await;
+        CacheBackend::Redis(_)
+        | CacheBackend::RedisCluster(_)
+        | CacheBackend::RedisSentinel(_, _) => {
+            let mgr = RedisManager::from_cache_backend(&cache_backend).await;
             cache::redis::new(mgr)
         }
     };
@@ -230,14 +143,14 @@ pub async fn run_with_prefix(
     tracing::debug!("Queue: Started");
 
     let op_webhook_sender = OperationalWebhookSenderInner::new(
-        cfg.jwt_secret.clone(),
+        cfg.jwt_signing_config.clone(),
         cfg.operational_webhook_address.clone(),
     );
 
     // OpenAPI/aide must be initialized before any routers are constructed
     // because its initialization sets generation-global settings which are
     // needed at router-construction time.
-    let mut openapi = initialize_openapi();
+    let mut openapi = openapi::initialize_openapi();
 
     let svc_cache = cache.clone();
     // build our application with a route
@@ -254,49 +167,48 @@ pub async fn run_with_prefix(
     let app = ApiRouter::new()
         .nest_api_service("/api/v1", v1_router)
         .finish_api(&mut openapi);
+
+    openapi::postprocess_spec(&mut openapi);
     let docs_router = docs::router(openapi);
-    let app = app
-        .merge(docs_router)
-        .layer(
-            ServiceBuilder::new().layer_fn(move |service| IdempotencyService {
-                cache: svc_cache.clone(),
-                service,
-            }),
-        )
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(AllowHeaders::mirror_request())
-                .max_age(Duration::from_secs(600)),
-        );
+    let app = app.merge(docs_router).layer((
+        layer_fn(move |service| IdempotencyService {
+            cache: svc_cache.clone(),
+            service,
+        }),
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(AllowHeaders::mirror_request())
+            .max_age(Duration::from_secs(600)),
+    ));
+    let svc = tower::make::Shared::new(
+        // It is important that this service wraps the router instead of being
+        // applied via `Router::layer`, as it would run after routing then.
+        NormalizePath::trim_trailing_slash(app),
+    );
 
     let with_api = cfg.api_enabled;
     let with_worker = cfg.worker_enabled;
-
     let listen_address = cfg.listen_address;
 
-    let (server, worker_loop, expired_message_cleaner_loop) = tokio::join!(
+    let ((), worker_loop, expired_message_cleaner_loop) = tokio::join!(
         async {
             if with_api {
-                if let Some(l) = listener {
-                    tracing::debug!("API: Listening on {}", l.local_addr().unwrap());
-                    axum::Server::from_tcp(l)
-                        .expect("Error starting http server")
-                        .serve(app.into_make_service())
-                        .with_graceful_shutdown(graceful_shutdown_handler())
+                let listener = match listener {
+                    Some(l) => l,
+                    None => TcpListener::bind(listen_address)
                         .await
-                } else {
-                    tracing::debug!("API: Listening on {}", listen_address);
-                    axum::Server::bind(&listen_address)
-                        .serve(app.into_make_service())
-                        .with_graceful_shutdown(graceful_shutdown_handler())
-                        .await
-                }
+                        .expect("Error binding to listen_address"),
+                };
+                tracing::debug!("API: Listening on {}", listener.local_addr().unwrap());
+
+                axum::serve(listener, svc)
+                    .with_graceful_shutdown(graceful_shutdown_handler())
+                    .await
+                    .unwrap();
             } else {
                 tracing::debug!("API: off");
                 graceful_shutdown_handler().await;
-                Ok(())
             }
         },
         async {
@@ -327,13 +239,19 @@ pub async fn run_with_prefix(
         }
     );
 
-    server.expect("Error initializing server");
     worker_loop.expect("Error initializing worker");
     expired_message_cleaner_loop.expect("Error initializing expired message cleaner")
 }
 
-pub fn setup_tracing(cfg: &ConfigurationInner) {
-    if std::env::var_os("RUST_LOG").is_none() {
+pub fn setup_tracing(
+    cfg: &ConfigurationInner,
+    for_test: bool,
+) -> (tracing::Dispatch, sentry::ClientInitGuard) {
+    let filter_directives = std::env::var("RUST_LOG").unwrap_or_else(|e| {
+        if let std::env::VarError::NotUnicode(_) = e {
+            eprintln!("RUST_LOG environment variable has non-utf8 contents, ignoring!");
+        }
+
         let level = cfg.log_level.to_string();
         let mut var = vec![
             format!("{CRATE_NAME}={level}"),
@@ -344,65 +262,136 @@ pub fn setup_tracing(cfg: &ConfigurationInner) {
             var.push(format!("sqlx={level}"));
         }
 
-        std::env::set_var("RUST_LOG", var.join(","));
-    }
+        var.join(",")
+    });
 
     let otel_layer = cfg.opentelemetry_address.as_ref().map(|addr| {
         // Configure the OpenTelemetry tracing layer
         opentelemetry::global::set_text_map_propagator(
-            opentelemetry::sdk::propagation::TraceContextPropagator::new(),
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
         );
 
         let exporter = opentelemetry_otlp::new_exporter()
             .tonic()
             .with_endpoint(addr);
 
-        let tracer = opentelemetry_otlp::new_pipeline()
+        let provider = opentelemetry_otlp::new_pipeline()
             .tracing()
             .with_exporter(exporter)
             .with_trace_config(
-                opentelemetry::sdk::trace::config()
+                opentelemetry_sdk::trace::Config::default()
                     .with_sampler(
                         cfg.opentelemetry_sample_ratio
-                            .map(opentelemetry::sdk::trace::Sampler::TraceIdRatioBased)
-                            .unwrap_or(opentelemetry::sdk::trace::Sampler::AlwaysOn),
+                            .map(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased)
+                            .unwrap_or(opentelemetry_sdk::trace::Sampler::AlwaysOn),
                     )
-                    .with_resource(opentelemetry::sdk::Resource::new(vec![
-                        opentelemetry::KeyValue::new("service.name", "svix_server"),
+                    .with_resource(opentelemetry_sdk::Resource::new(vec![
+                        opentelemetry::KeyValue::new(
+                            "service.name",
+                            cfg.opentelemetry_service_name.clone(),
+                        ),
                     ])),
             )
             .install_batch(Tokio)
             .unwrap();
+
+        // Based on the private `build_batch_with_exporter` method from opentelemetry-otlp
+        let tracer = provider
+            .tracer_builder("opentelemetry-otlp")
+            .with_schema_url(opentelemetry_semantic_conventions::SCHEMA_URL)
+            .build();
+
         tracing_opentelemetry::layer().with_tracer(tracer)
     });
 
-    // Then initialize logging with an additional layer priting to stdout. This additional layer is
-    // either formatted normally or in JSON format
-    // Fails if the subscriber was already initialized, which we can safely and silently ignore
-    let _ = match cfg.log_format {
-        cfg::LogFormat::Default => {
-            let stdout_layer = tracing_subscriber::fmt::layer();
-            tracing_subscriber::Registry::default()
-                .with(otel_layer)
-                .with(stdout_layer)
-                .with(tracing_subscriber::EnvFilter::from_default_env())
-                .try_init()
-        }
-        cfg::LogFormat::Json => {
-            let fmt = tracing_subscriber::fmt::format().json().flatten_event(true);
-            let json_fields = tracing_subscriber::fmt::format::JsonFields::new();
+    let sentry_guard = sentry::init(sentry::ClientOptions {
+        dsn: cfg.sentry_dsn.clone(),
+        environment: Some(Cow::Owned(cfg.environment.to_string())),
+        release: sentry::release_name!(),
+        ..Default::default()
+    });
 
-            let stdout_layer = tracing_subscriber::fmt::layer()
-                .event_format(fmt)
-                .fmt_fields(json_fields);
+    let sentry_layer =
+        sentry::integrations::tracing::layer().event_filter(|md| match *md.level() {
+            tracing::Level::ERROR | tracing::Level::WARN => EventFilter::Event,
+            _ => EventFilter::Ignore,
+        });
 
-            tracing_subscriber::Registry::default()
-                .with(otel_layer)
-                .with(stdout_layer)
-                .with(tracing_subscriber::EnvFilter::from_default_env())
-                .try_init()
+    // Then create a subscriber with an additional layer printing to stdout.
+    // This additional layer is either formatted normally or in JSON format.
+    let stdout_layer = if for_test {
+        tracing_subscriber::fmt::layer().with_test_writer().boxed()
+    } else {
+        match cfg.log_format {
+            cfg::LogFormat::Default => tracing_subscriber::fmt::layer().boxed(),
+            cfg::LogFormat::Json => {
+                let fmt = tracing_subscriber::fmt::format().json().flatten_event(true);
+                let json_fields = tracing_subscriber::fmt::format::JsonFields::new();
+
+                tracing_subscriber::fmt::layer()
+                    .event_format(fmt)
+                    .fmt_fields(json_fields)
+                    .boxed()
+            }
         }
     };
+
+    let registry = tracing_subscriber::Registry::default()
+        .with(otel_layer)
+        .with(sentry_layer)
+        .with(stdout_layer)
+        .with(tracing_subscriber::EnvFilter::new(filter_directives))
+        .into();
+
+    (registry, sentry_guard)
+}
+
+pub fn setup_metrics(cfg: &ConfigurationInner) -> Option<SdkMeterProvider> {
+    cfg.opentelemetry_address.as_ref().map(|addr| {
+        let exporter = opentelemetry_otlp::new_exporter()
+            .tonic()
+            .with_endpoint(addr);
+
+        opentelemetry_otlp::new_pipeline()
+            .metrics(Tokio)
+            .with_delta_temporality()
+            .with_exporter(exporter)
+            .with_resource(opentelemetry_sdk::Resource::new(vec![
+                opentelemetry::KeyValue::new(
+                    "service.name",
+                    cfg.opentelemetry_service_name.clone(),
+                ),
+                opentelemetry::KeyValue::new("instance_id", INSTANCE_ID.to_owned()),
+                opentelemetry::KeyValue::new(
+                    "service.version",
+                    option_env!("GITHUB_SHA").unwrap_or("unknown"),
+                ),
+            ]))
+            .build()
+            .unwrap()
+    })
+}
+
+pub fn setup_tracing_for_tests() {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // Output is only printed for failing tests, but still we shouldn't overload
+                // the output with unnecessary info. When debugging a specific test, it's easy
+                // to override this default by setting the `RUST_LOG` environment variable.
+                "svix_server=debug".into()
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer().with_test_writer())
+        .init();
+}
+
+#[cfg(test)]
+#[ctor::ctor]
+fn test_setup() {
+    setup_tracing_for_tests();
 }
 
 mod docs {
@@ -410,7 +399,6 @@ mod docs {
     use axum::{
         response::{Html, IntoResponse, Redirect},
         routing::get,
-        Json,
     };
 
     // TODO: switch to generated docs instead of hardcoded JSON once generated
@@ -428,8 +416,7 @@ mod docs {
     }
 
     async fn get_openapi_json() -> impl IntoResponse {
-        let json: serde_json::Value = serde_json::from_str(include_str!("static/openapi.json"))
-            .expect("Error: openapi.json does not exist");
-        Json(json)
+        static BODY: &str = include_str!("../../openapi.json");
+        ([(http::header::CONTENT_TYPE, "application/json")], BODY)
     }
 }

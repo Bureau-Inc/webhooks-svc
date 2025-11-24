@@ -1,17 +1,18 @@
 // SPDX-FileCopyrightText: © 2022 Svix Authors
 // SPDX-License-Identifier: MIT
 
-use crate::core::types::{
-    ApplicationId, BaseId, EndpointHeaders, EndpointId, EndpointIdOrUid, EndpointSecretInternal,
-    EndpointUid, EventChannelSet, EventTypeNameSet, ExpiringSigningKeys,
-};
-use crate::{ctx, error};
 use chrono::Utc;
-use sea_orm::ActiveValue::Set;
-use sea_orm::{entity::prelude::*, Condition};
-use sea_orm::{ConnectionTrait, IntoActiveModel};
+use sea_orm::{entity::prelude::*, ActiveValue::Set, Condition, IntoActiveModel, QuerySelect};
 
 use super::endpointmetadata;
+use crate::{
+    core::types::{
+        ApplicationId, BaseId, EndpointHeaders, EndpointId, EndpointIdOrUid,
+        EndpointSecretInternal, EndpointUid, EventChannelSet, EventTypeNameSet,
+        ExpiringSigningKeys,
+    },
+    error,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "endpoint")]
@@ -46,8 +47,6 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     Application,
-    #[sea_orm(has_many = "super::messagedestination::Entity")]
-    Messagedestination,
     #[sea_orm(has_one = "super::endpointmetadata::Entity")]
     Metadata,
 }
@@ -58,20 +57,18 @@ impl Related<super::application::Entity> for Entity {
     }
 }
 
-impl Related<super::messagedestination::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Messagedestination.def()
-    }
-}
-
 impl Related<super::endpointmetadata::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Metadata.def()
     }
 }
 
+#[axum::async_trait]
 impl ActiveModelBehavior for ActiveModel {
-    fn before_save(mut self, _insert: bool) -> Result<Self, DbErr> {
+    async fn before_save<C>(mut self, _db: &C, _insert: bool) -> Result<Self, DbErr>
+    where
+        C: ConnectionTrait,
+    {
         self.updated_at = Set(Utc::now().into());
         Ok(self)
     }
@@ -96,14 +93,12 @@ impl ActiveModel {
         app_id: ApplicationId,
         endp_id: EndpointIdOrUid,
     ) -> error::Result<Option<(Self, endpointmetadata::ActiveModel)>> {
-        let (endp, metadata) = match ctx!(
-            Entity::secure_find_by_id_or_uid(app_id, endp_id)
-                .find_also_related(endpointmetadata::Entity)
-                .one(db)
-                .await
-        )? {
-            Some(models) => models,
-            None => return Ok(None),
+        let Some((endp, metadata)) = Entity::secure_find_by_id_or_uid(app_id, endp_id)
+            .find_also_related(endpointmetadata::Entity)
+            .one(db)
+            .await?
+        else {
+            return Ok(None);
         };
 
         let metadata = metadata
@@ -134,5 +129,21 @@ impl Entity {
                 .add(Column::Id.eq(id_or_uid.to_owned()))
                 .add(Column::Uid.eq(id_or_uid)),
         )
+    }
+
+    pub fn secure_find_by_ids(
+        app_id: ApplicationId,
+        ids: impl IntoIterator<Item = EndpointId>,
+        want_deleted: bool,
+    ) -> Select<Entity> {
+        let mut q = Self::find()
+            .filter(Column::AppId.eq(app_id))
+            .filter(Column::Id.is_in(ids));
+
+        if !want_deleted {
+            q = q.filter(Column::Deleted.eq(false))
+        }
+
+        q.distinct()
     }
 }

@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: © 2022 Svix Authors
 // SPDX-License-Identifier: MIT
 
+use chrono::Utc;
+use sea_orm::{entity::prelude::*, ActiveValue::Set, Condition};
+
 use crate::core::types::{
     ApplicationId, BaseId, EventChannelSet, EventTypeName, MessageId, MessageIdOrUid, MessageUid,
     OrganizationId,
 };
-use chrono::Utc;
-use sea_orm::ActiveValue::Set;
-use sea_orm::{entity::prelude::*, Condition};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "message")]
@@ -19,8 +19,8 @@ pub struct Model {
     pub app_id: ApplicationId,
     pub event_type: EventTypeName,
     pub uid: Option<MessageUid>,
-    #[sea_orm(column_type = "JsonBinary", nullable)]
-    pub payload: Option<Json>,
+    #[sea_orm(column_type = "JsonBinary", column_name = "payload", nullable)]
+    pub legacy_payload: Option<Json>,
     pub channels: Option<EventChannelSet>,
     pub expiration: DateTimeWithTimeZone,
 }
@@ -35,8 +35,10 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     Application,
-    #[sea_orm(has_many = "super::messagedestination::Entity")]
-    Messagedestination,
+    #[sea_orm(has_one = "super::messagecontent::Entity")]
+    Messagecontent,
+    #[sea_orm(has_many = "super::messageattempt::Entity")]
+    Messageattempt,
 }
 
 impl Related<super::application::Entity> for Entity {
@@ -45,9 +47,15 @@ impl Related<super::application::Entity> for Entity {
     }
 }
 
-impl Related<super::messagedestination::Entity> for Entity {
+impl Related<super::messagecontent::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Messagedestination.def()
+        Relation::Messagecontent.def()
+    }
+}
+
+impl Related<super::messageattempt::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Messageattempt.def()
     }
 }
 

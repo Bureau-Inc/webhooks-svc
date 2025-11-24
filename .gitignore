@@ -1,9 +1,17 @@
 # Javascript
 /node_modules
 
-#PHP
+# PHP
 /vendor/
 composer.lock
+.phpunit.result.cache
 
-#IDE
+# IDE
 .vscode
+.idea
+
+# Rust
+target/
+
+# Codegen script
+/.codegen-tmp/

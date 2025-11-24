@@ -1,27 +1,6 @@
 // SPDX-FileCopyrightText: © 2022 Svix Authors
 // SPDX-License-Identifier: MIT
 
-use crate::{
-    core::{
-        permissions,
-        types::{metadata::Metadata, ApplicationId, ApplicationUid},
-    },
-    ctx,
-    db::models::{application, applicationmetadata},
-    error::{HttpError, Result},
-    transaction,
-    v1::utils::{
-        openapi_desc, openapi_tag,
-        patch::{
-            patch_field_non_nullable, patch_field_nullable, UnrequiredField,
-            UnrequiredNullableField,
-        },
-        validate_no_control_characters, validate_no_control_characters_unrequired,
-        validation_error, ApplicationPath, EmptyResponse, ListResponse, ModelIn, ModelOut,
-        Pagination, PaginationLimit, ValidatedJson, ValidatedQuery,
-    },
-    AppState,
-};
 use aide::axum::{
     routing::{get_with, post_with},
     ApiRouter,
@@ -31,13 +10,37 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use hyper::StatusCode;
+use futures::FutureExt;
 use schemars::JsonSchema;
-use sea_orm::ActiveModelTrait;
-use sea_orm::ActiveValue::Set;
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, TransactionTrait};
 use serde::{Deserialize, Serialize};
-use svix_server_derive::ModelOut;
+use svix_server_derive::{aide_annotate, ModelOut};
 use validator::{Validate, ValidationError};
+
+use crate::{
+    core::{
+        permissions,
+        types::{metadata::Metadata, ApplicationId, ApplicationUid, OrganizationId},
+    },
+    db::models::{application, applicationmetadata},
+    error::{http_error_on_conflict, HttpError, Result, Traceable},
+    v1::utils::{
+        apply_pagination, openapi_tag,
+        patch::{
+            patch_field_non_nullable, patch_field_nullable, UnrequiredField,
+            UnrequiredNullableField,
+        },
+        validate_no_control_characters, validate_no_control_characters_unrequired,
+        validation_error, ApplicationPath, IteratorDirection, JsonStatusUpsert, ListResponse,
+        ModelIn, ModelOut, NoContent, Ordering, Pagination, PaginationLimit, ReversibleIterator,
+        ValidatedJson, ValidatedQuery,
+    },
+    AppState,
+};
+
+fn application_name_example() -> &'static str {
+    "My first application"
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Validate, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +49,7 @@ pub struct ApplicationIn {
         length(min = 1, message = "Application names must be at least one character"),
         custom = "validate_no_control_characters"
     )]
+    #[schemars(example = "application_name_example")]
     pub name: String,
 
     #[validate(range(min = 1, message = "Application rate limits must be at least 1 if set"))]
@@ -123,9 +127,7 @@ impl ModelIn for ApplicationPatch {
     }
 }
 
-fn validate_name_length_patch(
-    name: &UnrequiredField<String>,
-) -> std::result::Result<(), ValidationError> {
+fn validate_name_length_patch(name: &UnrequiredField<String>) -> Result<(), ValidationError> {
     match name {
         UnrequiredField::Absent => Ok(()),
         UnrequiredField::Some(s) => {
@@ -143,7 +145,7 @@ fn validate_name_length_patch(
 
 fn validate_rate_limit_patch(
     rate_limit: &UnrequiredNullableField<u16>,
-) -> std::result::Result<(), ValidationError> {
+) -> Result<(), ValidationError> {
     match rate_limit {
         UnrequiredNullableField::Absent | UnrequiredNullableField::None => Ok(()),
         UnrequiredNullableField::Some(rate_limit) => {
@@ -165,6 +167,7 @@ pub struct ApplicationOut {
     // FIXME: Do we want to use serde(flatten) or just duplicate the keys?
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<ApplicationUid>,
+    #[schemars(example = "application_name_example")]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<u16>,
@@ -189,24 +192,44 @@ impl From<(application::Model, applicationmetadata::Model)> for ApplicationOut {
     }
 }
 
-const LIST_APPLICATIONS_DESCRIPTION: &str = "List all of the organization's applications.";
-
+/// List of all the organization's applications.
+#[aide_annotate(op_id = "v1.application.list")]
 async fn list_applications(
     State(AppState { ref db, .. }): State<AppState>,
-    pagination: ValidatedQuery<Pagination<ApplicationId>>,
+    ValidatedQuery(pagination): ValidatedQuery<Pagination<ReversibleIterator<ApplicationId>>>,
     permissions::Organization { org_id }: permissions::Organization,
 ) -> Result<Json<ListResponse<ApplicationOut>>> {
     let PaginationLimit(limit) = pagination.limit;
-    let iterator = pagination.iterator.clone();
+    let iterator = pagination.iterator;
+    let iter_direction = iterator
+        .as_ref()
+        .map_or(IteratorDirection::Normal, |iter| iter.direction());
 
-    let apps =
-        ctx!(application::Model::fetch_many_with_metadata(db, org_id, limit + 1, iterator).await)?;
+    let query = apply_pagination(
+        application::Entity::secure_find(org_id),
+        application::Column::Id,
+        limit,
+        iterator,
+        pagination.order.unwrap_or(Ordering::Ascending),
+    );
 
-    let results = apps.map(ApplicationOut::from).collect();
+    let results: Vec<ApplicationOut> = query
+        .find_also_related(applicationmetadata::Entity)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|(app, metadata)| {
+            let metadata =
+                metadata.unwrap_or_else(|| applicationmetadata::Model::new(app.id.clone()));
+            (app, metadata)
+        })
+        .map(ApplicationOut::from)
+        .collect();
 
-    Ok(Json(ApplicationOut::list_response_no_prev(
+    Ok(Json(ApplicationOut::list_response(
         results,
         limit as usize,
+        iter_direction,
     )))
 }
 
@@ -215,25 +238,29 @@ fn default_as_false() -> bool {
 }
 
 #[derive(Debug, Deserialize, Validate, JsonSchema)]
-pub struct CreateApplicationQuery {
+pub struct CreateApplicationQueryParams {
+    /// Get an existing application, or create a new one if doesn't exist. It's two separate functions in the libs.
     #[serde(default = "default_as_false")]
     get_if_exists: bool,
 }
 
-const CREATE_APPLICATION_DESCRIPTION: &str = "Create a new application.";
-
+/// Create a new application.
+#[aide_annotate(op_id = "v1.application.create")]
 async fn create_application(
     State(AppState { ref db, .. }): State<AppState>,
-    query: ValidatedQuery<CreateApplicationQuery>,
+    query: ValidatedQuery<CreateApplicationQueryParams>,
     permissions::Organization { org_id }: permissions::Organization,
     ValidatedJson(data): ValidatedJson<ApplicationIn>,
-) -> Result<(StatusCode, Json<ApplicationOut>)> {
+) -> Result<JsonStatusUpsert<ApplicationOut>> {
     if let Some(ref uid) = data.uid {
-        if let Some((app, metadata)) = ctx!(
-            application::Model::fetch_with_metadata(db, org_id.clone(), uid.clone().into()).await
-        )? {
+        if let Some((app, metadata)) =
+            application::Model::fetch_with_metadata(db, org_id.clone(), uid.clone().into())
+                .await
+                .trace()?
+        {
             if query.get_if_exists {
-                return Ok((StatusCode::OK, Json((app, metadata).into())));
+                // Technically not updated, but it fits.
+                return Ok(JsonStatusUpsert::Updated((app, metadata).into()));
             }
             return Err(HttpError::conflict(
                 None,
@@ -243,40 +270,57 @@ async fn create_application(
         };
     }
 
-    let app = application::ActiveModel::new(org_id.clone());
+    let (app, metadata) = create_app_from_app_in(db, data, org_id).await?;
+
+    Ok(JsonStatusUpsert::Created((app, metadata).into()))
+}
+
+pub async fn create_app_from_app_in(
+    db: &DatabaseConnection,
+    app_in: ApplicationIn,
+    org_id: OrganizationId,
+) -> Result<(application::Model, applicationmetadata::Model)> {
+    let app = application::ActiveModel::new(org_id);
     let metadata = applicationmetadata::ActiveModel::new(app.id.clone().unwrap(), None);
 
     let mut model = (app, metadata);
-    data.update_model(&mut model);
+    app_in.update_model(&mut model);
     let (app, metadata) = model;
 
-    let (app, metadata) = transaction!(db, |txn| async move {
-        let app_result = ctx!(app.insert(txn).await)?;
-        let metadata = ctx!(metadata.upsert_or_delete(txn).await)?;
-        Ok((app_result, metadata))
-    })?;
+    let (app, metadata) = db
+        .transaction(|txn| {
+            async move {
+                let app_result = app.insert(txn).await.map_err(http_error_on_conflict)?;
+                let metadata = metadata.upsert_or_delete(txn).await.trace()?;
+                Ok((app_result, metadata))
+            }
+            .boxed()
+        })
+        .await?;
 
-    Ok((StatusCode::CREATED, Json((app, metadata).into())))
+    Ok((app, metadata))
 }
 
-const GET_APPLICATION_DESCRIPTION: &str = "Get an application.";
-
+/// Get an application.
+#[aide_annotate(op_id = "v1.application.get")]
 async fn get_application(
     permissions::ApplicationWithMetadata { app, metadata }: permissions::ApplicationWithMetadata,
 ) -> Result<Json<ApplicationOut>> {
     Ok(Json((app, metadata).into()))
 }
 
-const UPDATE_APPLICATION_DESCRIPTION: &str = "Update an application.";
-
+/// Update an application.
+#[aide_annotate(op_id = "v1.application.update")]
 async fn update_application(
     State(AppState { ref db, .. }): State<AppState>,
     Path(ApplicationPath { app_id }): Path<ApplicationPath>,
     permissions::Organization { org_id }: permissions::Organization,
     ValidatedJson(data): ValidatedJson<ApplicationIn>,
-) -> Result<(StatusCode, Json<ApplicationOut>)> {
+) -> Result<JsonStatusUpsert<ApplicationOut>> {
     let (app, metadata, create_models) = if let Some((app, metadata)) =
-        ctx!(application::Model::fetch_with_metadata(db, org_id.clone(), app_id).await)?
+        application::Model::fetch_with_metadata(db, org_id.clone(), app_id)
+            .await
+            .trace()?
     {
         (app.into(), metadata.into(), false)
     } else {
@@ -289,99 +333,94 @@ async fn update_application(
     data.update_model(&mut models);
     let (app, metadata) = models;
 
-    let (app, metadata) = transaction!(db, |txn| async move {
-        let app = if create_models {
-            ctx!(app.insert(txn).await)?
-        } else {
-            ctx!(app.update(txn).await)?
-        };
-        let metadata = ctx!(metadata.upsert_or_delete(txn).await)?;
-        Ok((app, metadata))
-    })?;
+    let (app, metadata) = db
+        .transaction(|txn| {
+            async move {
+                let app = if create_models {
+                    app.insert(txn).await.map_err(http_error_on_conflict)?
+                } else {
+                    app.update(txn).await.map_err(http_error_on_conflict)?
+                };
+                let metadata = metadata.upsert_or_delete(txn).await?;
+                Ok((app, metadata))
+            }
+            .boxed()
+        })
+        .await?;
 
-    let status = if create_models {
-        StatusCode::CREATED
+    if create_models {
+        Ok(JsonStatusUpsert::Created((app, metadata).into()))
     } else {
-        StatusCode::OK
-    };
-    Ok((status, Json((app, metadata).into())))
+        Ok(JsonStatusUpsert::Updated((app, metadata).into()))
+    }
 }
 
-const PATCH_APPLICATION_DESCRIPTION: &str = "Partially update an application.";
-
+/// Partially update an application.
+#[aide_annotate]
 async fn patch_application(
     State(AppState { ref db, .. }): State<AppState>,
     permissions::OrganizationWithApplication { app }: permissions::OrganizationWithApplication,
     ValidatedJson(data): ValidatedJson<ApplicationPatch>,
 ) -> Result<Json<ApplicationOut>> {
-    let metadata = ctx!(app.fetch_or_create_metadata(db).await)?;
+    let metadata = app.fetch_or_create_metadata(db).await.trace()?;
     let app: application::ActiveModel = app.into();
 
     let mut model = (app, metadata);
     data.update_model(&mut model);
     let (app, metadata) = model;
 
-    let (app, metadata) = transaction!(db, |txn| async move {
-        let app = ctx!(app.update(txn).await)?;
-        let metadata = ctx!(metadata.upsert_or_delete(txn).await)?;
-        Ok((app, metadata))
-    })?;
+    let (app, metadata) = db
+        .transaction(|txn| {
+            async move {
+                let app = app.update(txn).await.map_err(http_error_on_conflict)?;
+                let metadata = metadata.upsert_or_delete(txn).await.trace()?;
+                Ok((app, metadata))
+            }
+            .boxed()
+        })
+        .await?;
 
     Ok(Json((app, metadata).into()))
 }
 
-const DELETE_APPLICATION_DESCRIPTION: &str = "Delete an application.";
-
+/// Delete an application.
+#[aide_annotate(op_id = "v1.application.delete")]
 async fn delete_application(
     State(AppState { ref db, .. }): State<AppState>,
     permissions::OrganizationWithApplication { app }: permissions::OrganizationWithApplication,
-) -> Result<(StatusCode, Json<EmptyResponse>)> {
+) -> Result<NoContent> {
     let mut app: application::ActiveModel = app.into();
     app.deleted = Set(true);
     app.uid = Set(None); // We don't want deleted UIDs to clash
-    ctx!(app.update(db).await)?;
-    Ok((StatusCode::NO_CONTENT, Json(EmptyResponse {})))
+    app.update(db).await?;
+    Ok(NoContent)
 }
 
 pub fn router() -> ApiRouter<AppState> {
     let tag = openapi_tag("Application");
     ApiRouter::new()
         .api_route_with(
-            "/app/",
-            post_with(
-                create_application,
-                openapi_desc(CREATE_APPLICATION_DESCRIPTION),
-            )
-            .get_with(
-                list_applications,
-                openapi_desc(LIST_APPLICATIONS_DESCRIPTION),
-            ),
+            "/app",
+            post_with(create_application, create_application_operation)
+                .get_with(list_applications, list_applications_operation),
             &tag,
         )
         .api_route_with(
-            "/app/:app_id/",
-            get_with(get_application, openapi_desc(GET_APPLICATION_DESCRIPTION))
-                .put_with(
-                    update_application,
-                    openapi_desc(UPDATE_APPLICATION_DESCRIPTION),
-                )
-                .patch_with(
-                    patch_application,
-                    openapi_desc(PATCH_APPLICATION_DESCRIPTION),
-                )
-                .delete_with(
-                    delete_application,
-                    openapi_desc(DELETE_APPLICATION_DESCRIPTION),
-                ),
+            "/app/:app_id",
+            get_with(get_application, get_application_operation)
+                .put_with(update_application, update_application_operation)
+                .patch_with(patch_application, patch_application_operation)
+                .delete_with(delete_application, delete_application_operation),
             tag,
         )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplicationIn, ApplicationPatch};
     use serde_json::json;
     use validator::Validate;
+
+    use super::{ApplicationIn, ApplicationPatch};
 
     const APP_NAME_INVALID: &str = "";
     const APP_NAME_VALID: &str = "test-app";
@@ -399,7 +438,7 @@ mod tests {
                     "rateLimit": RATE_LIMIT_INVALID }))
         .unwrap();
         let invalid_3: ApplicationIn = serde_json::from_value(json!({
-                    "name": APP_NAME_VALID, 
+                    "name": APP_NAME_VALID,
                     "uid": UID_INVALID }))
         .unwrap();
 
@@ -426,7 +465,7 @@ mod tests {
                     "rateLimit": RATE_LIMIT_INVALID }))
         .unwrap();
         let invalid_3: ApplicationPatch = serde_json::from_value(json!({
-                    "name": APP_NAME_VALID, 
+                    "name": APP_NAME_VALID,
                     "uid": UID_INVALID }))
         .unwrap();
 

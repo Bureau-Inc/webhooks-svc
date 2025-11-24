@@ -1,6 +1,6 @@
 <?php
 
-namespace Svix;
+namespace Svix\Tests;
 
 final class WebhookTest extends \PHPUnit\Framework\TestCase
 {
@@ -47,6 +47,18 @@ final class WebhookTest extends \PHPUnit\Framework\TestCase
 
         $testPayload = new TestPayload(time());
         $testPayload->header['svix-signature'] = 'v1,dawfeoifkpqwoekfpqoekf';
+
+        $wh = new \Svix\Webhook($testPayload->secret);
+        $wh->verify($testPayload->payload, $testPayload->header);
+    }
+
+    public function testBadlyFormattedSignatureThrowsException()
+    {
+        $this->expectException(\Svix\Exception\WebhookVerificationException::class);
+        $this->expectExceptionMessage("No matching signature found");
+
+        $testPayload = new TestPayload(time());
+        $testPayload->header['svix-signature'] = 'BAD_SIG_NATURE';
 
         $wh = new \Svix\Webhook($testPayload->secret);
         $wh->verify($testPayload->payload, $testPayload->header);
@@ -112,6 +124,10 @@ final class WebhookTest extends \PHPUnit\Framework\TestCase
 
     public function testMultiSigPayloadIsValid()
     {
+        // We're checking that `verify()` doesn't throw an exception.
+        // It doesn't return anything we can assert about.
+        $this->expectNotToPerformAssertions();
+
         $testPayload = new TestPayload(time());
         $sigs = [
             "v1,Ceo5qEr07ixe2NLpvHk3FH9bwy/WavXrAFQ/9tdO6mc=",
@@ -127,6 +143,10 @@ final class WebhookTest extends \PHPUnit\Framework\TestCase
 
     public function testSignatureVerificationWithAndWithoutPrefix()
     {
+        // We're checking that `verify()` doesn't throw an exception.
+        // It doesn't return anything we can assert about.
+        $this->expectNotToPerformAssertions();
+
         $testPayload = new TestPayload(time());
 
         $wh = new \Svix\Webhook($testPayload->secret);

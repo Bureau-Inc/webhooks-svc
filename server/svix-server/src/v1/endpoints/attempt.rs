@@ -1,31 +1,8 @@
 // SPDX-FileCopyrightText: © 2022 Svix Authors
 // SPDX-License-Identifier: MIT
 
-use crate::{
-    core::{
-        permissions,
-        types::{
-            EndpointId, EndpointIdOrUid, EventChannel, EventTypeNameSet, MessageAttemptId,
-            MessageAttemptTriggerType, MessageEndpointId, MessageId, MessageStatus,
-            StatusCodeClass,
-        },
-    },
-    ctx,
-    db::models::{endpoint, message, messagedestination},
-    err_database,
-    error::{Error, HttpError, Result},
-    queue::MessageTask,
-    v1::{
-        endpoints::message::MessageOut,
-        utils::{
-            apply_pagination_desc, iterator_from_before_or_after, openapi_desc, openapi_tag,
-            ApplicationEndpointPath, ApplicationMsgAttemptPath, ApplicationMsgEndpointPath,
-            ApplicationMsgPath, EmptyResponse, EventTypesQuery, ListResponse, ModelOut,
-            PaginationLimit, ReversibleIterator, ValidatedQuery,
-        },
-    },
-    AppState,
-};
+use std::collections::HashMap;
+
 use aide::axum::{
     routing::{delete_with, get_with, post_with},
     ApiRouter,
@@ -34,28 +11,65 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use chrono::{DateTime, Utc};
-
+use chrono::{DateTime, Duration, Utc};
 use hyper::StatusCode;
 use schemars::JsonSchema;
-use sea_orm::{
-    entity::prelude::*, sea_query::Expr, DatabaseConnection, IntoActiveModel, QueryOrder,
-    QuerySelect,
-};
-use serde::{Deserialize, Serialize};
-
-use svix_server_derive::ModelOut;
+use sea_orm::{entity::prelude::*, IntoActiveModel, QueryOrder, QuerySelect, QueryTrait};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
+use svix_server_derive::{aide_annotate, ModelOut};
 use validator::Validate;
 
-use crate::db::models::messageattempt;
-use crate::v1::utils::Pagination;
+use crate::{
+    core::{
+        permissions,
+        types::{
+            BaseId, EndpointId, EndpointIdOrUid, EventChannel, EventTypeNameSet, MessageAttemptId,
+            MessageAttemptTriggerType, MessageId, MessageStatus, StatusCodeClass,
+        },
+    },
+    db::models::{
+        endpoint, message,
+        messageattempt::{self, Query},
+        messagecontent,
+    },
+    error::{Error, HttpError, Result},
+    queue::MessageTask,
+    v1::{
+        endpoints::message::MessageOut,
+        utils::{
+            filter_and_paginate_time_limited, openapi_tag, ApplicationEndpointPath,
+            ApplicationMsgAttemptPath, ApplicationMsgEndpointPath, ApplicationMsgPath,
+            EventTypesQueryParams, IteratorDirection, ListResponse, ModelOut, NoContentWithCode,
+            PaginationDescending, PaginationLimit, ReversibleIterator, ValidatedQuery,
+        },
+    },
+    AppState,
+};
+
+fn example_status_code() -> i16 {
+    200
+}
+
+fn example_endpoint_url() -> &'static str {
+    "https://example.com/webhook/"
+}
+
+fn example_attempt_response() -> &'static str {
+    "{}"
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ModelOut, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageAttemptOut {
+    #[schemars(url, length(min = 1, max = 65_536), example = "example_endpoint_url")]
     pub url: String,
+    #[schemars(example = "example_attempt_response")]
     pub response: String,
+    #[schemars(example = "example_status_code")]
     pub response_status_code: i16,
+    /// Response duration in milliseconds.
+    pub response_duration_ms: i64,
     pub status: MessageStatus,
     pub trigger_type: MessageAttemptTriggerType,
     pub msg_id: MessageId,
@@ -74,6 +88,7 @@ impl From<messageattempt::Model> for MessageAttemptOut {
             url: model.url,
             response: model.response,
             response_status_code: model.response_status_code,
+            response_duration_ms: model.response_duration_ms,
             status: model.status,
             trigger_type: model.trigger_type,
             msg_id: model.msg_id,
@@ -87,9 +102,9 @@ impl From<messageattempt::Model> for MessageAttemptOut {
 
 /// A model containing information on a given message plus additional fields on the last attempt for
 /// that message.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct AttemptedMessageOut {
+pub struct EndpointMessageOut {
     #[serde(flatten)]
     pub msg: MessageOut,
     pub status: MessageStatus,
@@ -97,135 +112,348 @@ pub struct AttemptedMessageOut {
     pub next_attempt: Option<DateTimeWithTimeZone>,
 }
 
-impl ModelOut for AttemptedMessageOut {
+impl ModelOut for EndpointMessageOut {
     fn id_copy(&self) -> String {
         self.msg.id.0.clone()
     }
 }
 
-impl AttemptedMessageOut {
-    pub fn from_dest_and_msg(
-        dest: messagedestination::Model,
+impl EndpointMessageOut {
+    pub fn from_attempt_and_msg(
+        attempt: messageattempt::Model,
         msg: message::Model,
-    ) -> AttemptedMessageOut {
-        AttemptedMessageOut {
-            msg: msg.into(),
-            status: dest.status,
-            next_attempt: dest.next_attempt,
+        msg_content: Option<Vec<u8>>,
+        with_content: bool,
+    ) -> EndpointMessageOut {
+        let status = if attempt.next_attempt.is_some() {
+            MessageStatus::Sending
+        } else {
+            attempt.status
+        };
+        EndpointMessageOut {
+            msg: MessageOut::from_msg_and_payload(msg, msg_content, with_content),
+            status,
+            next_attempt: attempt.next_attempt,
         }
+    }
+}
+
+// XXX: only used in tests, so OK if it's a bit hacky
+impl<'de> Deserialize<'de> for EndpointMessageOut {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw_value = Box::<RawValue>::deserialize(deserializer)?;
+        let rest: HashMap<&str, &RawValue> = serde_json::from_str(raw_value.get()).unwrap();
+        Ok(Self {
+            msg: serde_json::from_str(raw_value.get()).unwrap(),
+            status: serde_json::from_str(rest.get("status").unwrap().get()).unwrap(),
+            next_attempt: rest
+                .get("next_attempt")
+                .map(|x| serde_json::from_str(x.get()).unwrap()),
+        })
     }
 }
 
 /// Additional parameters (besides pagination) in the query string for the "List Attempted Messages"
 /// endpoint.
 #[derive(Debug, Deserialize, Validate, JsonSchema)]
-pub struct ListAttemptedMessagesQueryParameters {
+pub struct ListAttemptedMessagesQueryParams {
+    /// Filter response based on the channel
     #[validate]
     channel: Option<EventChannel>,
+    /// Filter response based on the delivery status
     status: Option<MessageStatus>,
+    /// Only include items created before a certain date
     before: Option<DateTime<Utc>>,
+    /// Only include items created after a certain date
     after: Option<DateTime<Utc>>,
+    /// When `true` message payloads are included in the response
+    #[serde(default = "default_true")]
+    with_content: bool,
 }
 
-const LIST_ATTEMPTED_MESSAGES_DESCRIPTION: &str = r#"
-List messages for a particular endpoint. Additionally includes metadata about the latest message attempt.
+fn default_true() -> bool {
+    true
+}
 
-The `before` parameter lets you filter all items created before a certain date and is ignored if an iterator is passed.
-"#;
+pub const FUTURE_QUERY_LIMIT: chrono::Duration = chrono::Duration::hours(1);
+pub const LIMITED_QUERY_DURATION: chrono::Duration = chrono::Duration::days(90);
 
-/// Fetches a list of [`AttemptedMessageOut`]s associated with a given app and endpoint.
+pub fn limit_messageattempt_join<Q: QuerySelect + QueryOrder + QueryFilter>(
+    mut query: Q,
+    before: Option<DateTime<Utc>>,
+    after: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Q {
+    const SORT_COLUMN: messageattempt::Column = messageattempt::Column::Id;
+    if let Some(before) = before {
+        query = query
+            .filter(SORT_COLUMN.gt(MessageAttemptId::start_id(before - LIMITED_QUERY_DURATION)));
+        query = query
+            .filter(SORT_COLUMN.lt(MessageAttemptId::start_id(before + LIMITED_QUERY_DURATION)));
+    } else {
+        query =
+            query.filter(SORT_COLUMN.gt(MessageAttemptId::start_id(now - LIMITED_QUERY_DURATION)));
+    }
+    if let Some(after) = after {
+        query = query.filter(SORT_COLUMN.gt(MessageAttemptId::start_id(after)));
+        query =
+            query.filter(SORT_COLUMN.lt(MessageAttemptId::end_id(after + LIMITED_QUERY_DURATION)));
+    }
+
+    // blanket limit on future
+    query.filter(SORT_COLUMN.lt(MessageAttemptId::start_id(now + FUTURE_QUERY_LIMIT)))
+}
+
+fn limit_message_join<Q: QuerySelect + QueryOrder + QueryFilter>(
+    mut query: Q,
+    before: Option<DateTime<Utc>>,
+    after: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Q {
+    const SORT_COLUMN: message::Column = message::Column::Id;
+    if let Some(before) = before {
+        query = query
+            .filter(SORT_COLUMN.gt(MessageId::start_id(before - LIMITED_QUERY_DURATION)))
+            .filter(SORT_COLUMN.lt(MessageId::end_id(before)));
+    } else {
+        query = query.filter(SORT_COLUMN.gt(MessageId::start_id(now - LIMITED_QUERY_DURATION)));
+    }
+    if let Some(after) = after {
+        query = query
+            .filter(SORT_COLUMN.lt(MessageId::end_id(after + LIMITED_QUERY_DURATION)))
+            .filter(SORT_COLUMN.gt(MessageId::start_id(after)));
+    }
+
+    // blanket limit on future
+    query.filter(SORT_COLUMN.lt(MessageId::start_id(now + FUTURE_QUERY_LIMIT)))
+}
+
+/// List messages for a particular endpoint. Additionally includes metadata about the latest message attempt.
+///
+/// The `before` parameter lets you filter all items created before a certain date and is ignored if an iterator is passed.
+#[aide_annotate(op_id = "v1.message-attempt.list-attempted-messages")]
 async fn list_attempted_messages(
     State(AppState { ref db, .. }): State<AppState>,
-    ValidatedQuery(pagination): ValidatedQuery<Pagination<ReversibleIterator<MessageId>>>,
-    ValidatedQuery(ListAttemptedMessagesQueryParameters {
+    ValidatedQuery(pagination): ValidatedQuery<PaginationDescending<ReversibleIterator<MessageId>>>,
+    ValidatedQuery(ListAttemptedMessagesQueryParams {
         channel,
         status,
         before,
         after,
-    }): ValidatedQuery<ListAttemptedMessagesQueryParameters>,
+        with_content,
+    }): ValidatedQuery<ListAttemptedMessagesQueryParams>,
     Path(ApplicationEndpointPath { endpoint_id, .. }): Path<ApplicationEndpointPath>,
     permissions::Application { app }: permissions::Application,
-) -> Result<Json<ListResponse<AttemptedMessageOut>>> {
+    EventTypesQueryParams(event_types): EventTypesQueryParams,
+) -> Result<Json<ListResponse<EndpointMessageOut>>> {
     let PaginationLimit(limit) = pagination.limit;
-    let endp = ctx!(
-        endpoint::Entity::secure_find_by_id_or_uid(app.id.clone(), endpoint_id)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+    let endp = endpoint::Entity::secure_find_by_id_or_uid(app.id.clone(), endpoint_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
 
-    let mut dests_and_msgs = messagedestination::Entity::secure_find_by_endpoint(endp.id)
-        .find_also_related(message::Entity);
+    // Get only a single attempt per message. Later, we'll do a separate query to retrieve
+    // just the latest attempt for each id in our (small) list of message ids
+    let mut msgs_and_dests = message::Entity::secure_find(endp.app_id.clone())
+        .inner_join(messageattempt::Entity)
+        .filter(messageattempt::Column::EndpId.eq(endp.id.clone()))
+        .distinct_on([message::Column::Id.as_column_ref()]);
 
     if let Some(channel) = channel {
-        dests_and_msgs =
-            dests_and_msgs.filter(Expr::cust_with_values("channels @> $1", [channel.jsonb()]));
+        msgs_and_dests =
+            msgs_and_dests.filter(Expr::cust_with_values("channels @> $1", [channel.jsonb()]));
+    }
+
+    let now = chrono::Utc::now();
+
+    fn apply_status_filter<E: EntityTrait>(
+        query: Select<E>,
+        endp_id: EndpointId,
+        status: Option<MessageStatus>,
+        before: Option<DateTime<Utc>>,
+        after: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Select<E> {
+        if let Some(status) = status {
+            match status {
+                MessageStatus::Sending => {
+                    // Avoid looking back past 7 days since messages are very unlikely to be Pending/Sending beyond
+                    // that window
+                    let one_week_ago = Utc::now() - Duration::days(7);
+                    // 'MessageStatus::Sending' is never set on a messageattempt - instead, we check 'next_attempt'
+                    // on the returned row
+                    query
+                        .filter(
+                            messageattempt::Column::Id
+                                .gte(MessageAttemptId::start_id(one_week_ago)),
+                        )
+                        .filter(messageattempt::Column::NextAttempt.is_not_null())
+                        .filter(
+                            // Ensure that we don't include messages that also had a success or failure
+                            // in same time period.
+                            messageattempt::Column::MsgId.not_in_subquery(
+                                limit_messageattempt_join(
+                                    <messageattempt::Entity as EntityTrait>::find()
+                                        .select_only()
+                                        .column(messageattempt::Column::MsgId)
+                                        .filter(messageattempt::Column::EndpId.eq(endp_id))
+                                        .filter(messageattempt::Column::NextAttempt.is_null())
+                                        .filter(messageattempt::Column::Status.is_in(vec![
+                                            MessageStatus::Success,
+                                            MessageStatus::Fail,
+                                        ])),
+                                    Some(one_week_ago),
+                                    after,
+                                    now,
+                                )
+                                .into_query(),
+                            ),
+                        )
+                }
+                // An message with any successful attempts is considered successful - regardless of whether
+                // or not there were failed attempts before or after.
+                MessageStatus::Success => query.filter(messageattempt::Column::Status.eq(status)),
+                // A message with a 'final' failed attempt (and zero successful attempts) is considered failed.
+                // This failed attempt could either be the last scheduled attempt, or a manual attempt.
+                MessageStatus::Fail => {
+                    query
+                        .filter(messageattempt::Column::Status.eq(status))
+                        .filter(messageattempt::Column::NextAttempt.is_null())
+                        .filter(
+                            // If there were any successful attempts for this messages, then treat the message as success (even if we also have failed attempts)
+                            messageattempt::Column::MsgId.not_in_subquery(
+                                limit_messageattempt_join(
+                                    <messageattempt::Entity as EntityTrait>::find()
+                                        .select_only()
+                                        .column(messageattempt::Column::MsgId)
+                                        .filter(messageattempt::Column::EndpId.eq(endp_id))
+                                        .filter(
+                                            messageattempt::Column::Status
+                                                .eq(MessageStatus::Success),
+                                        ),
+                                    before,
+                                    after,
+                                    now,
+                                )
+                                .into_query(),
+                            ),
+                        )
+                }
+                MessageStatus::Pending => {
+                    unreachable!("MessageStatus::Pending should have already been handled")
+                }
+            }
+        } else {
+            query
+        }
     }
 
     if let Some(status) = status {
-        dests_and_msgs = dests_and_msgs.filter(messagedestination::Column::Status.eq(status));
+        // We no longer use this status, so we'll never look up anything with it
+        if status == MessageStatus::Pending {
+            return Ok(Json(ListResponse::empty()));
+        }
     }
 
-    async fn _get_msg_dest_id(
-        db: &DatabaseConnection,
-        msg_id: MessageId,
-    ) -> Result<MessageEndpointId> {
-        Ok(ctx!(
-            messagedestination::Entity::secure_find_by_msg(msg_id)
-                .one(db)
-                .await
-        )?
-        .ok_or_else(|| HttpError::bad_request(None, Some("Invalid iterator".to_owned())))?
-        .id)
+    msgs_and_dests =
+        apply_status_filter(msgs_and_dests, endp.id.clone(), status, before, after, now);
+
+    if let Some(EventTypeNameSet(event_types)) = event_types.clone() {
+        msgs_and_dests = msgs_and_dests.filter(message::Column::EventType.is_in(event_types));
     }
 
-    let msg_dest_iterator = match pagination.iterator {
-        Some(ReversibleIterator::Normal(msg_id)) => Some(ReversibleIterator::Normal(
-            _get_msg_dest_id(db, msg_id).await?,
-        )),
-        Some(ReversibleIterator::Prev(msg_id)) => Some(ReversibleIterator::Prev(
-            _get_msg_dest_id(db, msg_id).await?,
-        )),
-        None => None,
-    };
-    let iterator = iterator_from_before_or_after(msg_dest_iterator, before, after);
-    let is_prev = matches!(iterator, Some(ReversibleIterator::Prev(_)));
-
-    let dests_and_msgs = apply_pagination_desc(
-        dests_and_msgs,
-        messagedestination::Column::Id,
+    let (msgs_and_attempts, iter_direction) = filter_and_paginate_time_limited(
+        msgs_and_dests,
+        message::Column::Id,
         limit,
-        iterator,
+        pagination.iterator.clone(),
+        before,
+        after,
     );
 
-    let into = |(dest, msg): (messagedestination::Model, Option<message::Model>)| {
-        let msg =
-            msg.ok_or_else(|| err_database!("No associated message with messagedestination"))?;
-        Ok(AttemptedMessageOut::from_dest_and_msg(dest, msg))
+    let msgs_and_dests = limit_messageattempt_join(msgs_and_attempts, before, after, now);
+    let msgs_and_dests = limit_message_join(msgs_and_dests, before, after, now);
+
+    // We've found messages that have at least one matching 'messageattempt' row. Now, lookup the *latest*
+    // matching messageattempt row for each messages.
+    let results = msgs_and_dests.all(db).await?;
+    let mut latest_attempts = messageattempt::Entity::secure_find_by_endpoint(endp.id.clone())
+        .filter(messageattempt::Column::MsgId.is_in(results.iter().map(|msg| msg.id.clone())))
+        .latest_per_msg();
+
+    // Make sure we apply the 'status' filter (if it exists), so that we get the latest attempt matching
+    // the query parameters. All of our other filters only apply to 'message'.
+    latest_attempts =
+        apply_status_filter(latest_attempts, endp.id.clone(), status, before, after, now);
+    latest_attempts = limit_messageattempt_join(latest_attempts, before, after, now);
+
+    let mut latest_attempts: HashMap<_, _> = latest_attempts
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|attempt| (attempt.msg_id.clone(), attempt))
+        .collect();
+
+    let mut out = Vec::with_capacity(results.len());
+    let mut msg_content_map: Option<HashMap<_, _>> = if with_content {
+        let msg_ids = results.iter().map(|msg| msg.id.clone());
+        Some(
+            messagecontent::Entity::secure_find_by_id_in(msg_ids.collect())
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|m| (m.id, m.payload))
+                .collect(),
+        )
+    } else {
+        None
     };
 
-    let out = ctx!(dests_and_msgs.all(db).await)?
-        .into_iter()
-        .map(into)
-        .collect::<Result<_>>()?;
+    for msg in results {
+        let msg_content = msg_content_map.as_mut().and_then(|map| map.remove(&msg.id));
+        let Some(attempt) = latest_attempts.remove(&msg.id) else {
+            tracing::warn!(
+                msg_id = msg.id.to_string(),
+                "Missing attempt for message in list_attempted_messages"
+            );
+            continue;
+        };
+        out.push(EndpointMessageOut::from_attempt_and_msg(
+            attempt,
+            msg,
+            msg_content,
+            with_content,
+        ));
+    }
 
-    Ok(Json(AttemptedMessageOut::list_response(
+    Ok(Json(EndpointMessageOut::list_response(
         out,
         limit as usize,
-        is_prev,
+        iter_direction,
     )))
 }
 
 /// Additional parameters (besides pagination) in the query string for the "List Attempts by
 /// Endpoint" endpoint.
 #[derive(Debug, Deserialize, Validate, JsonSchema)]
-pub struct ListAttemptsByEndpointQueryParameters {
+pub struct ListAttemptsByEndpointQueryParams {
+    /// Filter response based on the delivery status
     status: Option<MessageStatus>,
+    /// Filter response based on the HTTP status code
     status_code_class: Option<StatusCodeClass>,
+    /// Filter response based on the channel
     #[validate]
     channel: Option<EventChannel>,
+    /// Only include items created before a certain date
     before: Option<DateTime<Utc>>,
+    /// Only include items created after a certain date
     after: Option<DateTime<Utc>>,
+    /// When `true` attempt content is included in the response
+    #[serde(default = "default_true")]
+    with_content: bool,
 }
 
 // Applies filters common to [`list_attempts_by_endpoint`] and [`list_attempts_by_msg`]
@@ -294,31 +522,31 @@ fn list_attempts_by_endpoint_or_message_filters(
     query
 }
 
-const LIST_ATTEMPTS_BY_ENDPOINT_DESCRIPTION: &str = "List attempts by endpoint id";
-
-/// Fetches a list of [`MessageAttemptOut`]s for a given endpoint ID
+/// List attempts by endpoint id
+#[aide_annotate(op_id = "v1.message-attempt.list-by-endpoint")]
 async fn list_attempts_by_endpoint(
     State(AppState { ref db, .. }): State<AppState>,
-    ValidatedQuery(pagination): ValidatedQuery<Pagination<ReversibleIterator<MessageAttemptId>>>,
-    ValidatedQuery(ListAttemptsByEndpointQueryParameters {
+    ValidatedQuery(pagination): ValidatedQuery<
+        PaginationDescending<ReversibleIterator<MessageAttemptId>>,
+    >,
+    ValidatedQuery(ListAttemptsByEndpointQueryParams {
         status,
         status_code_class,
         channel,
         before,
         after,
-    }): ValidatedQuery<ListAttemptsByEndpointQueryParameters>,
-    EventTypesQuery(event_types): EventTypesQuery,
+        with_content,
+    }): ValidatedQuery<ListAttemptsByEndpointQueryParams>,
+    EventTypesQueryParams(event_types): EventTypesQueryParams,
     Path(ApplicationEndpointPath { endpoint_id, .. }): Path<ApplicationEndpointPath>,
     permissions::Application { app }: permissions::Application,
 ) -> Result<Json<ListResponse<MessageAttemptOut>>> {
     let PaginationLimit(limit) = pagination.limit;
     // Confirm endpoint ID belongs to the given application
-    let endp = ctx!(
-        endpoint::Entity::secure_find_by_id_or_uid(app.id.clone(), endpoint_id)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+    let endp = endpoint::Entity::secure_find_by_id_or_uid(app.id.clone(), endpoint_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
 
     let query = list_attempts_by_endpoint_or_message_filters(
         messageattempt::Entity::secure_find_by_endpoint(endp.id),
@@ -328,61 +556,84 @@ async fn list_attempts_by_endpoint(
         channel,
     );
 
-    let iterator = iterator_from_before_or_after(pagination.iterator, before, after);
-    let is_prev = matches!(iterator, Some(ReversibleIterator::Prev(_)));
-    let query = apply_pagination_desc(query, messageattempt::Column::Id, limit, iterator);
+    let (query, iter_direction) = filter_and_paginate_time_limited(
+        query,
+        messageattempt::Column::Id,
+        limit,
+        pagination.iterator,
+        before,
+        after,
+    );
 
-    let out = ctx!(query.all(db).await)?
+    let out = query
+        .all(db)
+        .await?
         .into_iter()
+        .map(|mut attempt| {
+            if !with_content {
+                "{}".clone_into(&mut attempt.response)
+            }
+
+            attempt
+        })
         .map(Into::into)
         .collect();
 
     Ok(Json(MessageAttemptOut::list_response(
         out,
         limit as usize,
-        is_prev,
+        iter_direction,
     )))
 }
 
 /// Flattens in a [`ListAttemptsByEndpointOrMsgQueryParameters`] and adds one extra query parameter
 #[derive(Debug, Deserialize, Validate, JsonSchema)]
-pub struct ListAttemptsByMsgQueryParameters {
+pub struct ListAttemptsByMsgQueryParams {
+    /// Filter response based on the delivery status
     status: Option<MessageStatus>,
+    /// Filter response based on the HTTP status code
     status_code_class: Option<StatusCodeClass>,
+    /// Filter response based on the channel
     #[validate]
     channel: Option<EventChannel>,
+    /// Filter the attempts based on the attempted endpoint
     #[validate]
     endpoint_id: Option<EndpointIdOrUid>,
+    /// Only include items created before a certain date
     before: Option<DateTime<Utc>>,
+    /// Only include items created after a certain date
     after: Option<DateTime<Utc>>,
+    /// When `true` attempt content is included in the response
+    #[serde(default = "default_true")]
+    with_content: bool,
 }
 
-const LIST_ATTEMPTS_BY_MSG_DESCRIPTION: &str = "List attempts by message id";
-
-/// Fetches a list of [`MessageAttemptOut`]s for a given message ID
+/// List attempts by message id
+#[aide_annotate(op_id = "v1.message-attempt.list-by-msg")]
 async fn list_attempts_by_msg(
     State(AppState { ref db, .. }): State<AppState>,
-    ValidatedQuery(pagination): ValidatedQuery<Pagination<ReversibleIterator<MessageAttemptId>>>,
-    ValidatedQuery(ListAttemptsByMsgQueryParameters {
+    ValidatedQuery(pagination): ValidatedQuery<
+        PaginationDescending<ReversibleIterator<MessageAttemptId>>,
+    >,
+    ValidatedQuery(ListAttemptsByMsgQueryParams {
         status,
         status_code_class,
         channel,
         endpoint_id,
         before,
         after,
-    }): ValidatedQuery<ListAttemptsByMsgQueryParameters>,
+        with_content,
+    }): ValidatedQuery<ListAttemptsByMsgQueryParams>,
     Path(ApplicationMsgPath { msg_id, .. }): Path<ApplicationMsgPath>,
-    EventTypesQuery(event_types): EventTypesQuery,
+    EventTypesQueryParams(event_types): EventTypesQueryParams,
     permissions::Application { app }: permissions::Application,
 ) -> Result<Json<ListResponse<MessageAttemptOut>>> {
     let PaginationLimit(limit) = pagination.limit;
     // Confirm message ID belongs to the given application
-    let msg = ctx!(
-        message::Entity::secure_find_by_id_or_uid(app.id.clone(), msg_id)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+    let msg = message::Entity::secure_find_by_id_or_uid(app.id.clone(), msg_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
 
     let mut query = list_attempts_by_endpoint_or_message_filters(
         messageattempt::Entity::secure_find_by_msg(msg.id),
@@ -394,11 +645,10 @@ async fn list_attempts_by_msg(
 
     if let Some(endpoint_id) = endpoint_id {
         // Ensure the endpoint ID/UID belongs to the given application
-        if let Some(endp) = ctx!(
-            endpoint::Entity::secure_find_by_id_or_uid(app.id, endpoint_id)
-                .one(db)
-                .await
-        )? {
+        if let Some(endp) = endpoint::Entity::secure_find_by_id_or_uid(app.id, endpoint_id)
+            .one(db)
+            .await?
+        {
             // And filter by its ID incase a UID was used
             query = query.filter(messageattempt::Column::EndpId.eq(endp.id));
         } else {
@@ -406,29 +656,43 @@ async fn list_attempts_by_msg(
         }
     }
 
-    let iterator = iterator_from_before_or_after(pagination.iterator, before, after);
-    let is_prev = matches!(iterator, Some(ReversibleIterator::Prev(_)));
-    let query = apply_pagination_desc(query, messageattempt::Column::Id, limit, iterator);
-    let out = ctx!(query.all(db).await)?
+    let (query, iter_direction) = filter_and_paginate_time_limited(
+        query,
+        messageattempt::Column::Id,
+        limit,
+        pagination.iterator,
+        before,
+        after,
+    );
+    let out = query
+        .all(db)
+        .await?
         .into_iter()
+        .map(|mut attempt| {
+            if !with_content {
+                "{}".clone_into(&mut attempt.response)
+            }
+
+            attempt
+        })
         .map(Into::into)
         .collect();
 
     Ok(Json(MessageAttemptOut::list_response(
         out,
         limit as usize,
-        is_prev,
+        iter_direction,
     )))
 }
 
-/// A type combining information from [`messagedestination::Model`]s and [`endpoint::Model`]s to
-/// output information on attempted destinations
+// A type combining information from [`messageattempt::Model`]s and [`endpoint::Model`]s to
+// output information on attempted destinations
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageEndpointOut {
     #[serde(flatten)]
     endpoint: super::endpoint::EndpointOutCommon,
-    id: EndpointId,
+    pub id: EndpointId,
     status: MessageStatus,
     next_attempt: Option<DateTime<Utc>>,
 }
@@ -439,107 +703,147 @@ impl ModelOut for MessageEndpointOut {
     }
 }
 
-impl MessageEndpointOut {
-    fn from_dest_and_endp(dest: messagedestination::Model, endp: endpoint::Model) -> Self {
-        MessageEndpointOut {
-            id: endp.id.clone(),
-            endpoint: endp.into(),
-            status: dest.status,
-            next_attempt: dest.next_attempt.map(Into::into),
-        }
-    }
-}
-
-const LIST_ATTEMPTED_DESTINATIONS_DESCRIPTION: &str =
-    "`msg_id`: Use a message id or a message `eventId`";
-
+/// `msg_id`: Use a message id or a message `eventId`
+#[aide_annotate(op_id = "v1.message-attempt.list-attempted-destinations")]
 async fn list_attempted_destinations(
     State(AppState { ref db, .. }): State<AppState>,
-    ValidatedQuery(mut pagination): ValidatedQuery<Pagination<EndpointId>>,
+    ValidatedQuery(pagination): ValidatedQuery<
+        PaginationDescending<ReversibleIterator<EndpointId>>,
+    >,
     Path(ApplicationMsgPath { msg_id, .. }): Path<ApplicationMsgPath>,
     permissions::Application { app }: permissions::Application,
 ) -> Result<Json<ListResponse<MessageEndpointOut>>> {
     let PaginationLimit(limit) = pagination.limit;
-    let iterator = pagination.iterator.take();
+    let iterator: Option<ReversibleIterator<EndpointId>> = pagination.iterator;
+    let iter_direction = iterator
+        .as_ref()
+        .map_or(IteratorDirection::Normal, |iter| iter.direction());
 
     // Confirm message ID belongs to the given application while fetching the ID in case a UID was
     // given
-    let msg_id = if let Some(message) = ctx!(
+    let msg_id = if let Some(message) =
         message::Entity::secure_find_by_id_or_uid(app.id.clone(), msg_id.clone())
             .one(db)
-            .await
-    )? {
+            .await?
+    {
         message.id
     } else {
         return Err(Error::http(HttpError::not_found(None, None)));
     };
 
-    // Fetch the [`messagedestination::Model`] and associated [`endpoint::Model`]
-    let mut query = messagedestination::Entity::secure_find_by_msg(msg_id)
-        .find_also_related(endpoint::Entity)
-        .order_by_desc(messagedestination::Column::EndpId)
-        .limit(limit + 1);
+    let q = messageattempt::Entity::secure_find_by_msg(msg_id.clone());
 
-    if let Some(iterator) = iterator {
-        query = query.filter(messagedestination::Column::EndpId.lt(iterator));
-    }
+    // Add filters for upper/lower bounds of MessageAttemptId
+    let now = chrono::Utc::now();
+    let msg_attempt_lower_limit = MessageAttemptId::start_id(msg_id.timestamp());
+    let msg_attempt_upper_limit = MessageAttemptId::start_id(now + FUTURE_QUERY_LIMIT);
 
-    Ok(Json(MessageEndpointOut::list_response_no_prev(
-        ctx!(query.all(db).await)?
+    let q = q
+        .filter(messageattempt::Column::Id.gt(msg_attempt_lower_limit))
+        .filter(messageattempt::Column::Id.lt(msg_attempt_upper_limit))
+        .distinct_on([messageattempt::Column::EndpId])
+        .limit(limit);
+
+    let q = match iterator {
+        Some(ReversibleIterator::Prev(endp_id)) => q
+            .filter(messageattempt::Column::EndpId.lt(endp_id))
+            .order_by_desc(messageattempt::Column::EndpId),
+        Some(ReversibleIterator::Normal(endp_id)) => q
+            .filter(messageattempt::Column::EndpId.gt(endp_id))
+            .order_by_asc(messageattempt::Column::EndpId),
+        None => q.order_by_asc(messageattempt::Column::EndpId),
+    };
+
+    // Get the most recent attempt for each endpoint (this interacts
+    // with the 'distinct_on' clause)
+    let q = q.order_by_desc(messageattempt::Column::Id);
+
+    let msg_attempts = q.all(db).await?;
+    let endp_ids: Vec<_> = msg_attempts.iter().map(|m| m.endp_id.clone()).collect();
+
+    let want_deleted = true;
+    let endpoints: HashMap<EndpointId, endpoint::Model> =
+        endpoint::Entity::secure_find_by_ids(app.id, endp_ids, want_deleted)
+            .all(db)
+            .await?
             .into_iter()
-            .map(
-                |(dest, endp): (messagedestination::Model, Option<endpoint::Model>)| {
-                    let endp = endp.ok_or_else(|| {
-                        err_database!("No associated endpoint with messagedestination")
-                    })?;
-                    Ok(MessageEndpointOut::from_dest_and_endp(dest, endp))
-                },
-            )
-            .collect::<Result<_>>()?,
+            .map(|endp| (endp.id.clone(), endp))
+            .collect();
+
+    let results: Vec<MessageEndpointOut> = msg_attempts
+        .into_iter()
+        .filter_map(|msg_attempt: messageattempt::Model| {
+            let endp = endpoints.get(&msg_attempt.endp_id)?.clone();
+            Some(MessageEndpointOut {
+                id: msg_attempt.endp_id,
+                status: msg_attempt.status,
+                next_attempt: msg_attempt.next_attempt.map(Into::into),
+                endpoint: endp.into(),
+            })
+        })
+        .collect();
+
+    Ok(Json(MessageEndpointOut::list_response(
+        results,
         limit as usize,
+        iter_direction,
     )))
 }
 
 #[derive(Debug, Deserialize, Validate, JsonSchema)]
-pub struct ListAttemptsForEndpointQueryParameters {
+pub struct ListAttemptsForEndpointQueryParams {
+    /// Filter response based on the channel
     #[validate]
     pub channel: Option<EventChannel>,
+    /// Filter response based on the delivery status
     pub status: Option<MessageStatus>,
+    /// Only include items created before a certain date
     pub before: Option<DateTime<Utc>>,
+    /// Only include items created after a certain date
     pub after: Option<DateTime<Utc>>,
 }
 
-const LIST_ATTEMPTS_FOR_ENDPOINT_DESCRIPTION: &str = r#"
-DEPRECATED: please use list_attempts with endpoint_id as a query parameter instead.
+#[derive(Serialize, JsonSchema)]
+struct MessageAttemptEndpointOut {
+    #[serde(flatten)]
+    common_: MessageAttemptOut,
+}
 
-List the message attempts for a particular endpoint.
+impl From<MessageAttemptOut> for MessageAttemptEndpointOut {
+    fn from(common_: MessageAttemptOut) -> Self {
+        Self { common_ }
+    }
+}
 
-Returning the endpoint.
-
-The `before` parameter lets you filter all items created before a certain date and is ignored if an iterator is passed.
-"#;
-
+/// DEPRECATED: please use list_attempts with endpoint_id as a query parameter instead.
+///
+/// List the message attempts for a particular endpoint.
+///
+/// Returning the endpoint.
+///
+/// The `before` parameter lets you filter all items created before a certain date and is ignored if an iterator is passed.
+#[aide_annotate(op_id = "v1.message-attempt.list-by-endpoint-deprecated")]
 async fn list_attempts_for_endpoint(
     state: State<AppState>,
-    pagination: ValidatedQuery<Pagination<ReversibleIterator<MessageAttemptId>>>,
-    ValidatedQuery(ListAttemptsForEndpointQueryParameters {
+    pagination: ValidatedQuery<PaginationDescending<ReversibleIterator<MessageAttemptId>>>,
+    ValidatedQuery(ListAttemptsForEndpointQueryParams {
         channel,
         status,
         before,
         after,
-    }): ValidatedQuery<ListAttemptsForEndpointQueryParameters>,
-    event_types_query: EventTypesQuery,
+    }): ValidatedQuery<ListAttemptsForEndpointQueryParams>,
+    event_types_query: EventTypesQueryParams,
     Path(ApplicationMsgEndpointPath {
         app_id,
         msg_id,
         endpoint_id,
     }): Path<ApplicationMsgEndpointPath>,
     auth_app: permissions::Application,
-) -> Result<Json<ListResponse<MessageAttemptOut>>> {
+) -> Result<Json<ListResponse<MessageAttemptEndpointOut>>> {
     list_messageattempts(
         state,
         pagination,
-        ValidatedQuery(AttemptListFetchOptions {
+        ValidatedQuery(AttemptListFetchQueryParams {
             endpoint_id: Some(endpoint_id),
             channel,
             status,
@@ -551,56 +855,70 @@ async fn list_attempts_for_endpoint(
         auth_app,
     )
     .await
+    .map(|Json(list)| {
+        let new_data = list
+            .data
+            .into_iter()
+            .map(MessageAttemptEndpointOut::from)
+            .collect();
+        Json(ListResponse {
+            data: new_data,
+            done: list.done,
+            iterator: list.iterator,
+            prev_iterator: list.prev_iterator,
+        })
+    })
 }
 
 #[derive(Debug, Deserialize, Validate, JsonSchema)]
-pub struct AttemptListFetchOptions {
+pub struct AttemptListFetchQueryParams {
+    /// Filter the attempts based on the attempted endpoint
     #[validate]
     pub endpoint_id: Option<EndpointIdOrUid>,
+    /// Filter response based on the channel
     #[validate]
     pub channel: Option<EventChannel>,
+    /// Filter response based on the delivery status
     pub status: Option<MessageStatus>,
+    /// Only include items created before a certain date
     pub before: Option<DateTime<Utc>>,
+    /// Only include items created after a certain date
     pub after: Option<DateTime<Utc>>,
 }
 
-const LIST_MESSAGEATTEMPTS_DESCRIPTION: &str = r#"
-Deprecated: Please use "List Attempts by Endpoint" and "List Attempts by Msg" instead.
-
-`msg_id`: Use a message id or a message `eventId`
-"#;
-
+/// Deprecated: Please use "List Attempts by Endpoint" and "List Attempts by Msg" instead.
+///
+/// `msg_id`: Use a message id or a message `eventId`
+#[aide_annotate(op_id = "v1.message-attempt.list-by-msg-deprecated")]
 async fn list_messageattempts(
     State(AppState { ref db, .. }): State<AppState>,
-    ValidatedQuery(pagination): ValidatedQuery<Pagination<ReversibleIterator<MessageAttemptId>>>,
-    ValidatedQuery(AttemptListFetchOptions {
+    ValidatedQuery(pagination): ValidatedQuery<
+        PaginationDescending<ReversibleIterator<MessageAttemptId>>,
+    >,
+    ValidatedQuery(AttemptListFetchQueryParams {
         endpoint_id,
         channel,
         status,
         before,
         after,
-    }): ValidatedQuery<AttemptListFetchOptions>,
-    EventTypesQuery(event_types): EventTypesQuery,
+    }): ValidatedQuery<AttemptListFetchQueryParams>,
+    EventTypesQueryParams(event_types): EventTypesQueryParams,
     Path(ApplicationMsgPath { msg_id, .. }): Path<ApplicationMsgPath>,
     permissions::Application { app }: permissions::Application,
 ) -> Result<Json<ListResponse<MessageAttemptOut>>> {
     let PaginationLimit(limit) = pagination.limit;
-    let msg = ctx!(
-        message::Entity::secure_find_by_id_or_uid(app.id.clone(), msg_id)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+    let msg = message::Entity::secure_find_by_id_or_uid(app.id.clone(), msg_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
 
     let mut query = messageattempt::Entity::secure_find_by_msg(msg.id);
 
     if let Some(endpoint_id) = endpoint_id {
-        let endp = ctx!(
-            endpoint::Entity::secure_find_by_id_or_uid(app.id.clone(), endpoint_id)
-                .one(db)
-                .await
-        )?
-        .ok_or_else(|| HttpError::not_found(None, None))?;
+        let endp = endpoint::Entity::secure_find_by_id_or_uid(app.id.clone(), endpoint_id)
+            .one(db)
+            .await?
+            .ok_or_else(|| HttpError::not_found(None, None))?;
         query = query.filter(messageattempt::Column::EndpId.eq(endp.id))
     }
 
@@ -616,23 +934,25 @@ async fn list_messageattempts(
         query = query.filter(message::Column::EventType.is_in(event_types));
     }
 
-    let iterator = iterator_from_before_or_after(pagination.iterator, before, after);
-    let is_prev = matches!(iterator, Some(ReversibleIterator::Prev(_)));
-    let query = apply_pagination_desc(query, messageattempt::Column::Id, limit, iterator);
-    let out = ctx!(query.all(db).await)?
-        .into_iter()
-        .map(Into::into)
-        .collect();
+    let (query, iter_direction) = filter_and_paginate_time_limited(
+        query,
+        messageattempt::Column::Id,
+        limit,
+        pagination.iterator,
+        before,
+        after,
+    );
+    let out = query.all(db).await?.into_iter().map(Into::into).collect();
 
     Ok(Json(MessageAttemptOut::list_response(
         out,
         limit as usize,
-        is_prev,
+        iter_direction,
     )))
 }
 
-const GET_MESSAGEATTEMPT_DESCRIPTION: &str = "`msg_id`: Use a message id or a message `eventId`";
-
+/// `msg_id`: Use a message id or a message `eventId`
+#[aide_annotate(op_id = "v1.message-attempt.get")]
 async fn get_messageattempt(
     State(AppState { ref db, .. }): State<AppState>,
     Path(ApplicationMsgAttemptPath {
@@ -640,25 +960,21 @@ async fn get_messageattempt(
     }): Path<ApplicationMsgAttemptPath>,
     permissions::Application { app }: permissions::Application,
 ) -> Result<Json<MessageAttemptOut>> {
-    let msg = ctx!(
-        message::Entity::secure_find_by_id_or_uid(app.id, msg_id)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+    let msg = message::Entity::secure_find_by_id_or_uid(app.id, msg_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
 
-    let attempt = ctx!(
-        messageattempt::Entity::secure_find_by_msg(msg.id)
-            .filter(messageattempt::Column::Id.eq(attempt_id))
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+    let attempt = messageattempt::Entity::secure_find_by_msg(msg.id)
+        .filter(messageattempt::Column::Id.eq(attempt_id))
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
     Ok(Json(attempt.into()))
 }
 
-const RESEND_WEBHOOK_DESCRIPTION: &str = "Resend a message to the specified endpoint.";
-
+/// Resend a message to the specified endpoint.
+#[aide_annotate(op_id = "v1.message-attempt.resend")]
 async fn resend_webhook(
     State(AppState {
         ref db, queue_tx, ..
@@ -669,15 +985,18 @@ async fn resend_webhook(
         ..
     }): Path<ApplicationMsgEndpointPath>,
     permissions::Application { app }: permissions::Application,
-) -> Result<(StatusCode, Json<EmptyResponse>)> {
-    let msg = ctx!(
-        message::Entity::secure_find_by_id_or_uid(app.id.clone(), msg_id)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+) -> Result<NoContentWithCode<202>> {
+    let (msg, msg_content) = message::Entity::secure_find_by_id_or_uid(app.id.clone(), msg_id)
+        .find_also_related(messagecontent::Entity)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
 
-    if msg.payload.is_none() {
+    let msg_content = match msg_content {
+        Some(m) => serde_json::from_slice(&m.payload).ok(),
+        None => msg.legacy_payload,
+    };
+    if msg_content.is_none() {
         return Err(HttpError::bad_request(
             Some("missing_payload".to_string()),
             Some("Unable to resend message. Payload is missing (probably expired).".to_string()),
@@ -685,25 +1004,14 @@ async fn resend_webhook(
         .into());
     }
 
-    let endp = ctx!(
-        endpoint::Entity::secure_find_by_id_or_uid(app.id.clone(), endpoint_id)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
-
-    // Fetch it to make sure it was even a combination
-    let _msg_dest = ctx!(
-        messagedestination::Entity::secure_find_by_msg(msg.id.clone())
-            .filter(messagedestination::Column::EndpId.eq(endp.id.clone()))
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+    let endp = endpoint::Entity::secure_find_by_id_or_uid(app.id.clone(), endpoint_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
 
     queue_tx
         .send(
-            MessageTask::new_task(
+            &MessageTask::new_task(
                 msg.id.clone(),
                 app.id,
                 endp.id,
@@ -712,11 +1020,11 @@ async fn resend_webhook(
             None,
         )
         .await?;
-    Ok((StatusCode::ACCEPTED, Json(EmptyResponse {})))
+    Ok(NoContentWithCode)
 }
 
-const EXPUNGE_ATTEMPT_CONTENT_DESCRIPTION: &str = "Deletes the given attempt's response body. Useful when an endpoint accidentally returned sensitive content.";
-
+/// Deletes the given attempt's response body. Useful when an endpoint accidentally returned sensitive content.
+#[aide_annotate(op_id = "v1.message-attempt.expunge-content")]
 async fn expunge_attempt_content(
     State(AppState { ref db, .. }): State<AppState>,
     Path(ApplicationMsgAttemptPath {
@@ -724,24 +1032,20 @@ async fn expunge_attempt_content(
     }): Path<ApplicationMsgAttemptPath>,
     permissions::OrganizationWithApplication { app }: permissions::OrganizationWithApplication,
 ) -> Result<StatusCode> {
-    let msg = ctx!(
-        message::Entity::secure_find_by_id_or_uid(app.id, msg_id)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, Some("Message not found".to_string())))?;
+    let msg = message::Entity::secure_find_by_id_or_uid(app.id, msg_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, Some("Message not found".to_string())))?;
 
-    let mut attempt = ctx!(
-        messageattempt::Entity::secure_find_by_msg(msg.id)
-            .filter(messageattempt::Column::Id.eq(attempt_id))
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, Some("Message attempt not found".to_string())))?
-    .into_active_model();
+    let mut attempt = messageattempt::Entity::secure_find_by_msg(msg.id)
+        .filter(messageattempt::Column::Id.eq(attempt_id))
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, Some("Message attempt not found".to_string())))?
+        .into_active_model();
 
     attempt.response = sea_orm::Set("EXPUNGED".to_string());
-    ctx!(attempt.update(db).await)?;
+    attempt.update(db).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -751,86 +1055,72 @@ pub fn router() -> ApiRouter<AppState> {
     ApiRouter::new()
         // NOTE: [`list_messageattempts`] is deprecated
         .api_route_with(
-            "/app/:app_id/msg/:msg_id/attempt/",
-            get_with(
-                list_messageattempts,
-                openapi_desc(LIST_MESSAGEATTEMPTS_DESCRIPTION),
-            ),
+            "/app/:app_id/msg/:msg_id/attempt",
+            get_with(list_messageattempts, list_messageattempts_operation),
             &tag,
         )
         .api_route_with(
-            "/app/:app_id/msg/:msg_id/attempt/:attempt_id/",
-            get_with(
-                get_messageattempt,
-                openapi_desc(GET_MESSAGEATTEMPT_DESCRIPTION),
-            ),
+            "/app/:app_id/msg/:msg_id/attempt/:attempt_id",
+            get_with(get_messageattempt, get_messageattempt_operation),
             &tag,
         )
         .api_route_with(
-            "/app/:app_id/msg/:msg_id/attempt/:attempt_id/content/",
-            delete_with(
-                expunge_attempt_content,
-                openapi_desc(EXPUNGE_ATTEMPT_CONTENT_DESCRIPTION),
-            ),
+            "/app/:app_id/msg/:msg_id/attempt/:attempt_id/content",
+            delete_with(expunge_attempt_content, expunge_attempt_content_operation),
             &tag,
         )
         .api_route_with(
-            "/app/:app_id/msg/:msg_id/endpoint/",
+            "/app/:app_id/msg/:msg_id/endpoint",
             get_with(
                 list_attempted_destinations,
-                openapi_desc(LIST_ATTEMPTED_DESTINATIONS_DESCRIPTION),
+                list_attempted_destinations_operation,
             ),
             &tag,
         )
         .api_route_with(
-            "/app/:app_id/msg/:msg_id/endpoint/:endpoint_id/resend/",
-            post_with(resend_webhook, openapi_desc(RESEND_WEBHOOK_DESCRIPTION)),
+            "/app/:app_id/msg/:msg_id/endpoint/:endpoint_id/resend",
+            post_with(resend_webhook, resend_webhook_operation),
             &tag,
         )
         // NOTE: [`list_attempts_for_endpoint`] is deprecated
         .api_route_with(
-            "/app/:app_id/msg/:msg_id/endpoint/:endpoint_id/attempt/",
+            "/app/:app_id/msg/:msg_id/endpoint/:endpoint_id/attempt",
             get_with(
                 list_attempts_for_endpoint,
-                openapi_desc(LIST_ATTEMPTS_FOR_ENDPOINT_DESCRIPTION),
+                list_attempts_for_endpoint_operation,
             ),
             &tag,
         )
         .api_route_with(
-            "/app/:app_id/endpoint/:endpoint_id/msg/",
-            get_with(
-                list_attempted_messages,
-                openapi_desc(LIST_ATTEMPTED_MESSAGES_DESCRIPTION),
-            ),
+            "/app/:app_id/endpoint/:endpoint_id/msg",
+            get_with(list_attempted_messages, list_attempted_messages_operation),
             &tag,
         )
         .api_route_with(
-            "/app/:app_id/attempt/endpoint/:endpoint_id/",
+            "/app/:app_id/attempt/endpoint/:endpoint_id",
             get_with(
                 list_attempts_by_endpoint,
-                openapi_desc(LIST_ATTEMPTS_BY_ENDPOINT_DESCRIPTION),
+                list_attempts_by_endpoint_operation,
             ),
             &tag,
         )
         .api_route_with(
-            "/app/:app_id/attempt/msg/:msg_id/",
-            get_with(
-                list_attempts_by_msg,
-                openapi_desc(LIST_ATTEMPTS_BY_MSG_DESCRIPTION),
-            ),
+            "/app/:app_id/attempt/msg/:msg_id",
+            get_with(list_attempts_by_msg, list_attempts_by_msg_operation),
             tag,
         )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AttemptListFetchOptions, ListAttemptedMessagesQueryParameters,
-        ListAttemptsByEndpointQueryParameters, ListAttemptsByMsgQueryParameters,
-        ListAttemptsForEndpointQueryParameters,
-    };
     use serde_json::json;
     use validator::Validate;
+
+    use super::{
+        AttemptListFetchQueryParams, ListAttemptedMessagesQueryParams,
+        ListAttemptsByEndpointQueryParams, ListAttemptsByMsgQueryParams,
+        ListAttemptsForEndpointQueryParams,
+    };
 
     const INVALID_CHANNEL: &str = "$$invalid-channel";
     const VALID_CHANNEL: &str = "valid-channel";
@@ -839,33 +1129,33 @@ mod tests {
 
     #[test]
     fn test_list_attempted_messages_query_params_validation() {
-        let q: ListAttemptedMessagesQueryParameters =
+        let q: ListAttemptedMessagesQueryParams =
             serde_json::from_value(json!({ "channel": INVALID_CHANNEL })).unwrap();
         assert!(q.validate().is_err());
 
-        let q: ListAttemptedMessagesQueryParameters =
+        let q: ListAttemptedMessagesQueryParams =
             serde_json::from_value(json!({ "channel": VALID_CHANNEL })).unwrap();
         q.validate().unwrap();
     }
 
     #[test]
     fn test_list_attempts_by_endpoint_query_parameters_validation() {
-        let q: ListAttemptsByEndpointQueryParameters =
+        let q: ListAttemptsByEndpointQueryParams =
             serde_json::from_value(json!({ "channel": INVALID_CHANNEL })).unwrap();
         assert!(q.validate().is_err());
     }
 
     #[test]
     fn test_list_attempts_by_msg_query_parameters_validation() {
-        let q: ListAttemptsByMsgQueryParameters =
+        let q: ListAttemptsByMsgQueryParams =
             serde_json::from_value(json!({ "channel": INVALID_CHANNEL })).unwrap();
         assert!(q.validate().is_err());
 
-        let q: ListAttemptsByMsgQueryParameters =
+        let q: ListAttemptsByMsgQueryParams =
             serde_json::from_value(json!({ "endpoint_id": INVALID_ENDPOINT_ID })).unwrap();
         assert!(q.validate().is_err());
 
-        let q: ListAttemptsByMsgQueryParameters = serde_json::from_value(json!(
+        let q: ListAttemptsByMsgQueryParams = serde_json::from_value(json!(
             {
                 "channel": VALID_CHANNEL,
                 "endpoint_id": VALID_ENDPOINT_ID
@@ -877,26 +1167,26 @@ mod tests {
 
     #[test]
     fn test_list_attempts_for_endpoint_query_parameters_validation() {
-        let q: ListAttemptsForEndpointQueryParameters =
+        let q: ListAttemptsForEndpointQueryParams =
             serde_json::from_value(json!({ "channel": INVALID_CHANNEL })).unwrap();
         assert!(q.validate().is_err());
 
-        let q: ListAttemptsForEndpointQueryParameters =
+        let q: ListAttemptsForEndpointQueryParams =
             serde_json::from_value(json!({ "channel": VALID_CHANNEL })).unwrap();
         q.validate().unwrap();
     }
 
     #[test]
     fn test_attempt_list_fetch_options_validation() {
-        let q: AttemptListFetchOptions =
+        let q: AttemptListFetchQueryParams =
             serde_json::from_value(json!({ "endpoint_id": INVALID_ENDPOINT_ID })).unwrap();
         assert!(q.validate().is_err());
 
-        let q: AttemptListFetchOptions =
+        let q: AttemptListFetchQueryParams =
             serde_json::from_value(json!({ "channel": INVALID_CHANNEL })).unwrap();
         assert!(q.validate().is_err());
 
-        let q: AttemptListFetchOptions = serde_json::from_value(json!(
+        let q: AttemptListFetchQueryParams = serde_json::from_value(json!(
             {
                 "endpoint_id": VALID_ENDPOINT_ID,
                 "channel": VALID_CHANNEL

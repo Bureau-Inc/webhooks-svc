@@ -9,27 +9,34 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::headers::{authorization::Credentials, Authorization};
+use axum::{body::Body, response::Response};
+use axum_extra::headers::{authorization::Credentials, Authorization};
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
-use http::header::HeaderName;
-use http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Version};
-use hyper::{
-    client::connect::{dns::Name, HttpConnector},
-    ext::HeaderCaseMap,
-    Body, Client, Uri,
+use hickory_resolver::{lookup_ip::LookupIpIntoIter, ResolveError, Resolver, TokioResolver};
+use http::{header::HeaderName, HeaderMap, HeaderValue, Method, StatusCode, Version};
+use http_body_util::Full;
+use hyper::{body::Incoming, ext::HeaderCaseMap, Uri};
+use hyper_openssl::client::legacy::{HttpsConnector, MaybeHttpsStream};
+use hyper_util::{
+    client::legacy::{
+        connect::{
+            dns::Name,
+            proxy::{SocksV5, Tunnel},
+            HttpConnector,
+        },
+        Client,
+    },
+    rt::{TokioExecutor, TokioIo},
 };
-use hyper_openssl::HttpsConnector;
 use ipnet::IpNet;
-use openssl::ssl::{SslConnector, SslMethod};
+use openssl::ssl::{SslConnector, SslConnectorBuilder, SslMethod, SslVerifyMode};
 use serde::Serialize;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::{net::TcpStream, sync::Mutex};
 use tower::Service;
-use trust_dns_resolver::{
-    error::ResolveError, lookup_ip::LookupIpIntoIter, AsyncResolver, TokioConnection,
-    TokioConnectionProvider, TokioHandle,
-};
+
+use crate::cfg::{ProxyAddr, ProxyConfig};
 
 pub type CaseSensitiveHeaderMap = HashMap<String, HeaderValue>;
 
@@ -41,7 +48,7 @@ pub enum Error {
     #[error("requests to this IP range are blocked (see the server configuration)")]
     BlockedIp,
     #[error("error resolving name: {0}")]
-    ResolveError(#[from] ResolveError),
+    Resolve(#[from] ResolveError),
 
     #[error("request timed out")]
     TimedOut,
@@ -49,11 +56,31 @@ pub enum Error {
     #[error("error forming request: {0}")]
     InvalidHttpRequest(http::Error),
     #[error("error making request: {0}")]
-    FailedRequest(hyper::Error),
+    FailedRequest(hyper_util::client::legacy::Error),
 }
 
+impl From<hyper_util::client::legacy::Error> for Error {
+    fn from(e: hyper_util::client::legacy::Error) -> Self {
+        let mut dyn_e = &e as &dyn std::error::Error;
+        loop {
+            if dyn_e
+                .to_string()
+                .contains("requests to this IP range are blocked")
+            {
+                return Error::BlockedIp;
+            }
+
+            match dyn_e.source() {
+                Some(source) => dyn_e = source,
+                None => return Error::FailedRequest(e),
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct WebhookClient {
-    client: Client<HttpsConnector<NonLocalConnector>, Body>,
+    client: Client<SvixHttpsConnector, Full<Bytes>>,
     whitelist_nets: Arc<Vec<IpNet>>,
 }
 
@@ -61,23 +88,28 @@ impl WebhookClient {
     pub fn new(
         whitelist_nets: Option<Arc<Vec<IpNet>>>,
         whitelist_names: Option<Arc<Vec<String>>>,
+        dangerous_disable_tls_verification: bool,
+        proxy_config: Option<&ProxyConfig>,
     ) -> Self {
         let whitelist_nets = whitelist_nets.unwrap_or_else(|| Arc::new(Vec::new()));
         let whitelist_names = whitelist_names.unwrap_or_else(|| Arc::new(Vec::new()));
 
-        let mut connector = HttpConnector::new_with_resolver(NonLocalDnsResolver::new(
-            whitelist_nets.clone(),
-            whitelist_names,
-        ));
-        connector.enforce_http(false);
+        let dns_resolver = NonLocalDnsResolver::new(whitelist_nets.clone(), whitelist_names);
+        let mut http = HttpConnector::new_with_resolver(dns_resolver);
+        http.enforce_http(false);
 
         // Openssl is required here -- in practice, rustls does not support many
         // ciphers that we encounter on a regular basis:
-        let ssl = SslConnector::builder(SslMethod::tls()).expect("SslConnector build failed");
-        let https = HttpsConnector::with_connector(NonLocalConnector { connector }, ssl)
-            .expect("HttpsConnector build failed");
+        let mut ssl = SslConnector::builder(SslMethod::tls()).expect("SslConnector build failed");
+        if dangerous_disable_tls_verification {
+            tracing::warn!("TLS certificate verification has been disabled by the configuration.");
+            ssl.set_verify(SslVerifyMode::NONE);
+        }
 
-        let client: Client<_, hyper::Body> = Client::builder()
+        let https = SvixHttpsConnector::new(http, proxy_config, ssl)
+            .expect("SvixHttpsConnector build failed");
+
+        let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
             .http1_ignore_invalid_headers_in_responses(true)
             .http1_title_case_headers(true)
             .build(https);
@@ -88,15 +120,16 @@ impl WebhookClient {
         }
     }
 
-    pub async fn execute(&self, request: Request) -> Result<Response<Body>, Error> {
-        self.execute_inner(request, true).await
+    pub async fn execute(&self, request: Request) -> Result<Response, Error> {
+        let resp = self.execute_inner(request, true).await?;
+        Ok(resp.map(Body::new))
     }
 
     pub fn execute_inner(
         &self,
         request: Request,
         retry: bool,
-    ) -> BoxFuture<Result<Response<Body>, Error>> {
+    ) -> BoxFuture<'_, Result<Response<Incoming>, Error>> {
         async move {
             let org_req = request.clone();
             if let Some(auth) = request.uri.authority() {
@@ -117,14 +150,14 @@ impl WebhookClient {
                     .method(request.method)
                     .uri(request.uri)
                     .version(request.version)
-                    .body(Body::from(body))
+                    .body(Full::from(body))
                     .map_err(Error::InvalidHttpRequest)?
             } else {
                 hyper::Request::builder()
                     .method(request.method)
                     .uri(request.uri)
                     .version(request.version)
-                    .body(Body::empty())
+                    .body(Full::default())
                     .map_err(Error::InvalidHttpRequest)?
             };
 
@@ -138,27 +171,11 @@ impl WebhookClient {
             let res = if let Some(timeout) = request.timeout {
                 match tokio::time::timeout(timeout, self.client.request(req)).await {
                     Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err({
-                        if e.to_string()
-                            .contains("requests to this IP range are blocked")
-                        {
-                            Error::BlockedIp
-                        } else {
-                            Error::FailedRequest(e)
-                        }
-                    }),
+                    Ok(Err(e)) => Err(e.into()),
                     Err(_to) => Err(Error::TimedOut),
                 }
             } else {
-                self.client.request(req).await.map_err(|e| {
-                    if e.to_string()
-                        .contains("requests to this IP range are blocked")
-                    {
-                        Error::BlockedIp
-                    } else {
-                        Error::FailedRequest(e)
-                    }
-                })
+                self.client.request(req).await.map_err(Into::into)
             };
 
             if !retry {
@@ -166,13 +183,10 @@ impl WebhookClient {
             }
 
             match res {
-                Err(ref e) => match e {
-                    Error::FailedRequest(e) if start.elapsed() < Duration::from_millis(1000) => {
-                        tracing::info!("Insta-retrying: {}", e);
-                        self.execute_inner(org_req, false).await
-                    }
-                    _ => res,
-                },
+                Err(Error::FailedRequest(e)) if start.elapsed() < Duration::from_millis(1000) => {
+                    tracing::info!("Insta-retrying: {e}");
+                    self.execute_inner(org_req, false).await
+                }
                 res => res,
             }
         }
@@ -212,14 +226,19 @@ pub struct RequestBuildError(pub Vec<BuildError>);
 
 impl std::fmt::Display for RequestBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let err_str = self.0.iter().fold(String::default(), |acc, err| {
-            if acc.is_empty() {
-                format!("Build failed: {err}")
-            } else {
-                format!("{acc}; {err}")
+        let mut iter = self.0.iter();
+
+        f.write_str("Build failed")?;
+
+        if let Some(first) = iter.next() {
+            write!(f, ": {first}")?;
+
+            for err in iter {
+                write!(f, "; {err}")?;
             }
-        });
-        write!(f, "{err_str}")
+        }
+
+        Ok(())
     }
 }
 
@@ -303,7 +322,7 @@ impl RequestBuilder {
                     case_sensitive_hdrs.insert(key, Bytes::copy_from_slice(k.as_bytes()));
                 }
                 Err(e) => {
-                    tracing::error!("Failured to parse header {} {}", k, e);
+                    tracing::error!("Failed to parse header {} {}", k, e);
                 }
             }
         }
@@ -375,15 +394,16 @@ impl RequestBuilder {
         let uri = self.uri.unwrap();
         let authority = uri.authority().expect("Missing authority");
         let host = match authority.port() {
-            Some(port) => format!("{}:{}", authority.host(), port),
-            None => authority.host().to_string(),
-        };
+            Some(port) => HeaderValue::from_str(&format!("{}:{port}", authority.host())),
+            None => HeaderValue::from_str(authority.host()),
+        }
+        .unwrap();
 
         let mut headers = HeaderMap::with_capacity(3 + custom_headers.len());
 
         // Ensure that host header is first -- even though this is technically
         // not required by HTTP spec, some clients fail if it's not first:
-        headers.insert(http::header::HOST, HeaderValue::from_str(&host).unwrap());
+        headers.insert(http::header::HOST, host);
         headers.insert(
             http::header::ACCEPT,
             self.accept.unwrap_or(HeaderValue::from_static("*/*")),
@@ -394,7 +414,7 @@ impl RequestBuilder {
                 .unwrap_or(HeaderValue::from_static("application/json")),
         );
 
-        headers.extend(custom_headers.into_iter());
+        headers.extend(custom_headers);
 
         if let Some(user_agent) = self.user_agent {
             headers.insert(http::header::USER_AGENT, user_agent);
@@ -421,29 +441,73 @@ impl RequestBuilder {
     }
 }
 
-#[derive(Clone, Debug)]
-struct NonLocalConnector {
-    connector: HttpConnector<NonLocalDnsResolver>,
+/// HTTP connector that blocks outgoing requests to private IPs with support
+/// for HTTPS and optionally proxying via SOCKS5 or HTTP(S).
+#[derive(Clone)]
+enum SvixHttpsConnector {
+    Regular(HttpsConnector<NonLocalHttpConnector>),
+    Socks5Proxy(HttpsConnector<SocksV5<NonLocalHttpConnector>>),
+    HttpProxy(HttpsConnector<Tunnel<NonLocalHttpConnector>>),
 }
 
-impl Service<Uri> for NonLocalConnector {
-    type Response = <hyper::client::HttpConnector as Service<Uri>>::Response;
-    type Error = <hyper::client::HttpConnector as Service<Uri>>::Error;
+impl SvixHttpsConnector {
+    fn new(
+        inner: NonLocalHttpConnector,
+        proxy_cfg: Option<&ProxyConfig>,
+        ssl: SslConnectorBuilder,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        match proxy_cfg {
+            Some(proxy_cfg) => match proxy_cfg.addr.clone() {
+                ProxyAddr::Socks5(proxy_addr) => {
+                    let socks = SocksV5::new(proxy_addr, inner).local_dns(true);
+                    let socks_https = HttpsConnector::with_connector(socks, ssl)?;
+                    Ok(Self::Socks5Proxy(socks_https))
+                }
+                ProxyAddr::Http(proxy_addr) => {
+                    let tunnel = Tunnel::new(proxy_addr, inner);
+                    let tunnel_https = HttpsConnector::with_connector(tunnel, ssl)?;
+                    Ok(Self::HttpProxy(tunnel_https))
+                }
+            },
+            None => {
+                let https = HttpsConnector::with_connector(inner, ssl)?;
+                Ok(Self::Regular(https))
+            }
+        }
+    }
+}
 
-    type Future = <hyper::client::HttpConnector<NonLocalDnsResolver> as Service<Uri>>::Future;
+impl Service<Uri> for SvixHttpsConnector {
+    type Response = MaybeHttpsStream<TokioIo<TcpStream>>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.connector.poll_ready(cx)
+        match self {
+            Self::Regular(inner) => inner.poll_ready(cx),
+            Self::Socks5Proxy(inner) => inner.poll_ready(cx),
+            Self::HttpProxy(inner) => inner.poll_ready(cx),
+        }
     }
 
     fn call(&mut self, req: Uri) -> Self::Future {
-        self.connector.call(req)
+        match self {
+            Self::Regular(inner) => Box::pin(inner.call(req)),
+            Self::Socks5Proxy(inner) => Box::pin(inner.call(req)),
+            Self::HttpProxy(inner) => Box::pin(inner.call(req)),
+        }
     }
 }
 
+/// A plain-HTTP connector that blocks outgoing requests to private IPs.
+type NonLocalHttpConnector = HttpConnector<NonLocalDnsResolver>;
+
+/// A DNS resolver that produces an error for names that resolve to private IPs.
+///
+/// Specific private subnets or domain names may be whitelisted.
 #[derive(Clone, Debug)]
 struct NonLocalDnsResolver {
     state: Arc<Mutex<DnsState>>,
@@ -454,7 +518,7 @@ struct NonLocalDnsResolver {
 #[derive(Clone, Debug)]
 enum DnsState {
     Init,
-    Ready(Arc<AsyncResolver<TokioConnection, TokioConnectionProvider>>),
+    Ready(Arc<TokioResolver>),
 }
 
 impl NonLocalDnsResolver {
@@ -549,13 +613,12 @@ impl Iterator for SocketAddrs {
     }
 }
 
-async fn new_resolver(
-) -> Result<Arc<AsyncResolver<TokioConnection, TokioConnectionProvider>>, ResolveError> {
-    Ok(Arc::new(AsyncResolver::from_system_conf(TokioHandle)?))
+async fn new_resolver() -> Result<Arc<TokioResolver>, ResolveError> {
+    Ok(Arc::new(Resolver::builder_tokio()?.build()))
 }
 
 fn is_allowed(addr: IpAddr) -> bool {
-    match addr {
+    match addr.to_canonical() {
         IpAddr::V4(addr) => {
             !addr.is_private()
                 && !addr.is_loopback()
@@ -610,9 +673,19 @@ fn is_documentation_v6(addr: Ipv6Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::IpAddr, str::FromStr};
+    use std::{
+        net::{IpAddr, TcpListener},
+        path::PathBuf,
+        str::FromStr,
+        sync::Arc,
+    };
 
-    use super::*;
+    use axum::{routing, Router};
+    use axum_server::tls_openssl::{OpenSSLAcceptor, OpenSSLConfig};
+    use http::{HeaderValue, Method, Version};
+    use ipnet::IpNet;
+
+    use super::{is_allowed, CaseSensitiveHeaderMap, RequestBuilder, WebhookClient};
 
     #[test]
     fn is_allowed_test() {
@@ -639,6 +712,12 @@ mod tests {
         assert!(!is_allowed(IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0x1])));
 
         assert!(is_allowed(IpAddr::from([0, 0, 0, 0xffff, 0, 0, 0, 0x1])));
+        assert!(is_allowed(
+            "2001:4860:4860::8888".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_allowed("::ffff:8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(!is_allowed("::ffff:127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!is_allowed("::ffff:0.0.0.1".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
@@ -762,5 +841,62 @@ mod tests {
             req_with_port.headers.get("host").unwrap(),
             "127.0.0.1:8000".as_bytes()
         );
+    }
+
+    #[tokio::test]
+    async fn test_tls_verification_disable() {
+        // Self-signed certificates are expected to be found in `server/svix-server/tests/static` from
+        // the repository root.
+        //
+        // Some have been pre-generated into that directory via the following command:
+        //
+        // ```
+        // openssl req -x509 -newkey rsa:4096 -keyout ex_key.pem -out ex_cert.pem -sha256 \
+        // -days 36500 -nodes
+        // ```
+        //
+        // Then, via the interactive prompt, a `.` was entered for all fields but the common name,
+        // which was set to `localhost`.
+        //
+        // NOTE: It doesn't really matter the contents of these files as long as they are a valid key
+        // and certificate that is self-signed, expired, or otherwise unable to pass verification.
+        let dir: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "static"]
+            .iter()
+            .collect();
+        let config =
+            OpenSSLConfig::from_pem_file(dir.join("ex_cert.pem"), dir.join("ex_key.pem")).unwrap();
+        let acceptor = OpenSSLAcceptor::new(config);
+
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://{}/", tcp.local_addr().unwrap());
+
+        let app = Router::new().route("/", routing::any(|| async { "Hello" }));
+
+        let _jh = tokio::spawn(async {
+            axum_server::from_tcp(tcp)
+                .acceptor(acceptor)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let request = RequestBuilder::new()
+            .method(Method::GET)
+            .uri_str(&url)
+            .unwrap()
+            .version(Version::HTTP_11)
+            .build()
+            .unwrap();
+
+        let whitelist = Arc::new(vec![IpNet::new("127.0.0.1".parse().unwrap(), 0).unwrap()]);
+
+        // Assert that a [`WebhookClient`] without the disabled flag will err on making to a request
+        // to this server with the self-signed certificate
+        let whc_with_validation = WebhookClient::new(Some(whitelist.clone()), None, false, None);
+        assert!(whc_with_validation.execute(request.clone()).await.is_err());
+
+        // And assert that when the flag is enabled, that it will succeed
+        let whc_without_validation = WebhookClient::new(Some(whitelist), None, true, None);
+        assert!(whc_without_validation.execute(request).await.is_ok());
     }
 }

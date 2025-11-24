@@ -1,12 +1,12 @@
+use std::iter;
+
 use axum::{
     extract::{Path, State},
     Json,
 };
 use chrono::{Duration, Utc};
-use hyper::StatusCode;
-use sea_orm::ActiveModelTrait;
-use sea_orm::ActiveValue::Set;
-use std::iter;
+use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+use svix_server_derive::aide_annotate;
 
 use super::{EndpointSecretOut, EndpointSecretRotateIn};
 use crate::{
@@ -17,10 +17,9 @@ use crate::{
         permissions,
         types::{EndpointSecretInternal, ExpiringSigningKey, ExpiringSigningKeys},
     },
-    ctx,
     db::models::endpoint,
     error::{HttpError, Result},
-    v1::utils::{ApplicationEndpointPath, EmptyResponse, ValidatedJson},
+    v1::utils::{ApplicationEndpointPath, NoContent, ValidatedJson},
     AppState,
 };
 
@@ -34,31 +33,27 @@ pub(super) fn generate_secret(
     }
 }
 
-pub(super) const GET_ENDPOINT_SECRET_DESCRIPTION: &str = r#"
-Get the endpoint's signing secret.
-
-This is used to verify the authenticity of the webhook.
-For more information please refer to [the consuming webhooks docs](https://docs.svix.com/consuming-webhooks/).
-"#;
-
+/// Get the endpoint's signing secret.
+///
+/// This is used to verify the authenticity of the webhook.
+/// For more information please refer to [the consuming webhooks docs](https://docs.svix.com/consuming-webhooks/).
+#[aide_annotate(op_id = "v1.endpoint.get-secret")]
 pub(super) async fn get_endpoint_secret(
     State(AppState { ref db, cfg, .. }): State<AppState>,
     Path(ApplicationEndpointPath { endpoint_id, .. }): Path<ApplicationEndpointPath>,
     permissions::Application { app }: permissions::Application,
 ) -> Result<Json<EndpointSecretOut>> {
-    let endp = ctx!(
-        endpoint::Entity::secure_find_by_id_or_uid(app.id, endpoint_id)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+    let endp = endpoint::Entity::secure_find_by_id_or_uid(app.id, endpoint_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
     Ok(Json(EndpointSecretOut {
         key: endp.key.into_endpoint_secret(&cfg.encryption)?,
     }))
 }
 
-pub(super) const ROTATE_ENDPOINT_SECRET_DESCRIPTION: &str = "Rotates the endpoint's signing secret.  The previous secret will be valid for the next 24 hours.";
-
+/// Rotates the endpoint's signing secret.  The previous secret will be valid for the next 24 hours.
+#[aide_annotate(op_id = "v1.endpoint.rotate-secret")]
 pub(super) async fn rotate_endpoint_secret(
     State(AppState {
         ref db,
@@ -69,13 +64,11 @@ pub(super) async fn rotate_endpoint_secret(
     Path(ApplicationEndpointPath { endpoint_id, .. }): Path<ApplicationEndpointPath>,
     permissions::Application { app }: permissions::Application,
     ValidatedJson(data): ValidatedJson<EndpointSecretRotateIn>,
-) -> Result<(StatusCode, Json<EmptyResponse>)> {
-    let mut endp = ctx!(
-        endpoint::Entity::secure_find_by_id_or_uid(app.id, endpoint_id)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+) -> Result<NoContent> {
+    let mut endp = endpoint::Entity::secure_find_by_id_or_uid(app.id, endpoint_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
 
     let now = Utc::now();
     let last_key = ExpiringSigningKey {
@@ -117,7 +110,7 @@ pub(super) async fn rotate_endpoint_secret(
         ))),
         ..endp.into()
     };
-    let endp = ctx!(endp.update(db).await)?;
+    let endp = endp.update(db).await?;
 
     op_webhooks
         .send_operational_webhook(
@@ -126,5 +119,5 @@ pub(super) async fn rotate_endpoint_secret(
         )
         .await?;
 
-    Ok((StatusCode::NO_CONTENT, Json(EmptyResponse {})))
+    Ok(NoContent)
 }

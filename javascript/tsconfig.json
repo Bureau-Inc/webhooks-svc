@@ -22,9 +22,12 @@
   },
   "exclude": [
     "dist",
+    "test_build",
     "node_modules",
+    "templates",
     "jest.config.js",
     "src/**/*.test.ts",
+    "eslint.config.mjs"
   ],
   "filesGlob": ["./src/**/*.ts"]
 }

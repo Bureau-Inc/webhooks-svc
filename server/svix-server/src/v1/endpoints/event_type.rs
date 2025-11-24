@@ -1,26 +1,6 @@
 // SPDX-FileCopyrightText: © 2022 Svix Authors
 // SPDX-License-Identifier: MIT
 
-use crate::{
-    core::{
-        permissions,
-        types::{EventTypeName, FeatureFlag},
-    },
-    ctx,
-    db::models::eventtype,
-    error::{HttpError, Result},
-    v1::utils::{
-        api_not_implemented, openapi_desc, openapi_tag,
-        patch::{
-            patch_field_non_nullable, patch_field_nullable, UnrequiredField,
-            UnrequiredNullableField,
-        },
-        validate_no_control_characters, validate_no_control_characters_unrequired, EmptyResponse,
-        EventTypeNamePath, ListResponse, ModelIn, ModelOut, Pagination, PaginationLimit,
-        ValidatedJson, ValidatedQuery,
-    },
-    AppState,
-};
 use aide::axum::{
     routing::{get_with, post_with},
     ApiRouter,
@@ -30,22 +10,60 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use hyper::StatusCode;
 use schemars::JsonSchema;
-use sea_orm::{entity::prelude::*, ActiveValue::Set, QueryOrder};
-use sea_orm::{ActiveModelTrait, QuerySelect};
+use sea_orm::{entity::prelude::*, ActiveValue::Set};
 use serde::{Deserialize, Serialize};
-use svix_server_derive::{ModelIn, ModelOut};
+use svix_server_derive::{aide_annotate, ModelIn, ModelOut};
 use validator::Validate;
+
+use crate::{
+    core::{
+        permissions,
+        types::{EventTypeName, FeatureFlag},
+    },
+    db::models::eventtype,
+    error::{http_error_on_conflict, HttpError, Result},
+    v1::utils::{
+        api_not_implemented, apply_pagination, openapi_desc, openapi_tag,
+        patch::{
+            patch_field_non_nullable, patch_field_nullable, UnrequiredField,
+            UnrequiredNullableField,
+        },
+        validate_no_control_characters, validate_no_control_characters_unrequired,
+        EventTypeNamePath, IteratorDirection, JsonStatus, JsonStatusUpsert, ListResponse, ModelIn,
+        ModelOut, NoContent, Ordering, Pagination, PaginationLimit, ReversibleIterator,
+        ValidatedJson, ValidatedQuery,
+    },
+    AppState,
+};
+
+fn example_event_archived() -> bool {
+    false
+}
+
+fn event_type_description_example() -> &'static str {
+    "A user has signed up"
+}
+
+fn event_type_versioned_schemas_example() -> serde_json::Value {
+    serde_json::json!({ "1": eventtype::schema_example() })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate, ModelIn, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventTypeIn {
+    #[validate]
     pub name: EventTypeName,
     #[validate(custom = "validate_no_control_characters")]
+    #[schemars(example = "event_type_description_example")]
     pub description: String,
     #[serde(default, rename = "archived")]
+    #[schemars(example = "example_event_archived")]
     pub deleted: bool,
+    #[serde(default)]
+    pub deprecated: bool,
+    /// The schema for the event type for a specific version as a JSON schema.
+    #[schemars(example = "event_type_versioned_schemas_example")]
     pub schemas: Option<eventtype::Schema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feature_flag: Option<FeatureFlag>,
@@ -62,6 +80,7 @@ impl ModelIn for EventTypeIn {
             deleted,
             schemas,
             feature_flag,
+            deprecated,
         } = self;
 
         model.name = Set(name);
@@ -69,6 +88,7 @@ impl ModelIn for EventTypeIn {
         model.deleted = Set(deleted);
         model.schemas = Set(schemas);
         model.feature_flag = Set(feature_flag);
+        model.deprecated = Set(deprecated);
     }
 }
 
@@ -76,9 +96,15 @@ impl ModelIn for EventTypeIn {
 #[serde(rename_all = "camelCase")]
 struct EventTypeUpdate {
     #[validate(custom = "validate_no_control_characters")]
+    #[schemars(example = "event_type_description_example")]
     description: String,
     #[serde(default, rename = "archived")]
+    #[schemars(example = "example_event_archived")]
     deleted: bool,
+    #[serde(default)]
+    deprecated: bool,
+    /// The schema for the event type for a specific version as a JSON schema.
+    #[schemars(example = "event_type_versioned_schemas_example")]
     schemas: Option<eventtype::Schema>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     feature_flag: Option<FeatureFlag>,
@@ -92,12 +118,14 @@ impl ModelIn for EventTypeUpdate {
         let EventTypeUpdate {
             description,
             deleted,
+            deprecated,
             schemas,
             feature_flag,
         } = self;
 
         model.description = Set(description);
         model.deleted = Set(deleted);
+        model.deprecated = Set(deprecated);
         model.schemas = Set(schemas);
         model.feature_flag = Set(feature_flag);
     }
@@ -117,6 +145,9 @@ struct EventTypePatch {
     )]
     deleted: UnrequiredField<bool>,
 
+    #[serde(default, skip_serializing_if = "UnrequiredField::is_absent")]
+    deprecated: UnrequiredField<bool>,
+
     #[serde(default, skip_serializing_if = "UnrequiredNullableField::is_absent")]
     schemas: UnrequiredNullableField<eventtype::Schema>,
 
@@ -131,12 +162,14 @@ impl ModelIn for EventTypePatch {
         let EventTypePatch {
             description,
             deleted,
+            deprecated,
             schemas,
             feature_flag,
         } = self;
 
         patch_field_non_nullable!(model, description);
         patch_field_non_nullable!(model, deleted);
+        patch_field_non_nullable!(model, deprecated);
         patch_field_nullable!(model, schemas);
         patch_field_nullable!(model, feature_flag);
     }
@@ -146,9 +179,14 @@ impl ModelIn for EventTypePatch {
 #[serde(rename_all = "camelCase")]
 pub struct EventTypeOut {
     pub name: EventTypeName,
+    #[schemars(example = "event_type_description_example")]
     pub description: String,
     #[serde(rename = "archived")]
+    #[schemars(example = "example_event_archived", default = "example_event_archived")]
     pub deleted: bool,
+    pub deprecated: bool,
+    /// The schema for the event type for a specific version as a JSON schema.
+    #[schemars(example = "event_type_versioned_schemas_example")]
     pub schemas: Option<eventtype::Schema>,
 
     pub created_at: DateTime<Utc>,
@@ -172,6 +210,7 @@ impl From<eventtype::Model> for EventTypeOut {
             name: model.name,
             description: model.description,
             deleted: model.deleted,
+            deprecated: model.deprecated,
             schemas: model.schemas,
             feature_flag: model.feature_flag,
 
@@ -182,19 +221,21 @@ impl From<eventtype::Model> for EventTypeOut {
 }
 
 #[derive(Debug, Deserialize, Validate, JsonSchema)]
-pub struct ListFetchOptions {
+pub struct ListFetchQueryParams {
+    /// When `true` archived (deleted but not expunged) items are included in the response
     #[serde(default)]
     pub include_archived: bool,
+    /// When `true` the full item (including the schema) is included in the response
     #[serde(default)]
     pub with_content: bool,
 }
 
-const LIST_EVENT_TYPES_DESCRIPTION: &str = "Return the list of event types.";
-
+/// Return the list of event types.
+#[aide_annotate(op_id = "v1.event-type.list")]
 async fn list_event_types(
     State(AppState { ref db, .. }): State<AppState>,
-    pagination: ValidatedQuery<Pagination<EventTypeName>>,
-    fetch_options: ValidatedQuery<ListFetchOptions>,
+    ValidatedQuery(pagination): ValidatedQuery<Pagination<ReversibleIterator<EventTypeName>>>,
+    fetch_options: ValidatedQuery<ListFetchQueryParams>,
     permissions::ReadAll {
         org_id,
         feature_flags,
@@ -202,26 +243,33 @@ async fn list_event_types(
     }: permissions::ReadAll,
 ) -> Result<Json<ListResponse<EventTypeOut>>> {
     let PaginationLimit(limit) = pagination.limit;
-    let iterator = pagination.iterator.clone();
+    let iterator = pagination.iterator;
+    let iter_direction = iterator
+        .as_ref()
+        .map_or(IteratorDirection::Normal, |iter| iter.direction());
 
-    let mut query = eventtype::Entity::secure_find(org_id)
-        .order_by_asc(eventtype::Column::Name)
-        .limit(limit + 1);
+    let mut query = eventtype::Entity::secure_find(org_id);
 
     if !fetch_options.include_archived {
         query = query.filter(eventtype::Column::Deleted.eq(false));
-    }
-
-    if let Some(iterator) = iterator {
-        query = query.filter(eventtype::Column::Name.gt(iterator));
     }
 
     if let permissions::AllowedFeatureFlags::Some(flags) = feature_flags {
         query = eventtype::Entity::filter_feature_flags(query, flags);
     }
 
-    Ok(Json(EventTypeOut::list_response_no_prev(
-        ctx!(query.all(db).await)?
+    let query = apply_pagination(
+        query,
+        eventtype::Column::Name,
+        limit,
+        iterator,
+        Ordering::Ascending,
+    );
+
+    Ok(Json(EventTypeOut::list_response(
+        query
+            .all(db)
+            .await?
             .into_iter()
             .map(|x| {
                 if !fetch_options.with_content {
@@ -232,34 +280,31 @@ async fn list_event_types(
             })
             .collect(),
         limit as usize,
+        iter_direction,
     )))
 }
 
-const CREATE_EVENT_TYPE_DESCRIPTION: &str = r#"
-Create new or unarchive existing event type.
-
-Unarchiving an event type will allow endpoints to filter on it and messages to be sent with it.
-Endpoints filtering on the event type before archival will continue to filter on it.
-This operation does not preserve the description and schemas.
-"#;
-
+/// Create new or unarchive existing event type.
+///
+/// Unarchiving an event type will allow endpoints to filter on it and messages to be sent with it.
+/// Endpoints filtering on the event type before archival will continue to filter on it.
+/// This operation does not preserve the description and schemas.
+#[aide_annotate(op_id = "v1.event-type.create")]
 async fn create_event_type(
     State(AppState { ref db, .. }): State<AppState>,
     permissions::Organization { org_id }: permissions::Organization,
     ValidatedJson(data): ValidatedJson<EventTypeIn>,
-) -> Result<(StatusCode, Json<EventTypeOut>)> {
-    let evtype = ctx!(
-        eventtype::Entity::secure_find_by_name(org_id.clone(), data.name.to_owned())
-            .one(db)
-            .await
-    )?;
+) -> Result<JsonStatus<201, EventTypeOut>> {
+    let evtype = eventtype::Entity::secure_find_by_name(org_id.clone(), data.name.to_owned())
+        .one(db)
+        .await?;
     let ret = match evtype {
         Some(evtype) => {
             if evtype.deleted {
                 let mut evtype: eventtype::ActiveModel = evtype.into();
                 evtype.deleted = Set(false);
                 data.update_model(&mut evtype);
-                ctx!(evtype.update(db).await)?
+                evtype.update(db).await?
             } else {
                 return Err(HttpError::conflict(
                     Some("event_type_exists".to_owned()),
@@ -273,14 +318,14 @@ async fn create_event_type(
                 org_id: Set(org_id),
                 ..data.into()
             };
-            ctx!(evtype.insert(db).await)?
+            evtype.insert(db).await.map_err(http_error_on_conflict)?
         }
     };
-    Ok((StatusCode::CREATED, Json(ret.into())))
+    Ok(JsonStatus(ret.into()))
 }
 
-const GET_EVENT_TYPE_DESCRIPTION: &str = "Get an event type.";
-
+/// Get an event type.
+#[aide_annotate(op_id = "v1.event-type.get")]
 async fn get_event_type(
     State(AppState { ref db, .. }): State<AppState>,
     Path(EventTypeNamePath { event_type_name }): Path<EventTypeNamePath>,
@@ -294,96 +339,106 @@ async fn get_event_type(
     if let permissions::AllowedFeatureFlags::Some(flags) = feature_flags {
         query = eventtype::Entity::filter_feature_flags(query, flags);
     }
-    let evtype = ctx!(query.one(db).await)?.ok_or_else(|| HttpError::not_found(None, None))?;
+    let evtype = query
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
 
     Ok(Json(evtype.into()))
 }
 
-const UPDATE_EVENT_TYPE_DESCRIPTION: &str = "Update an event type.";
-
+/// Update an event type.
+#[aide_annotate(op_id = "v1.event-type.update")]
 async fn update_event_type(
     State(AppState { ref db, .. }): State<AppState>,
     Path(EventTypeNamePath { event_type_name }): Path<EventTypeNamePath>,
     permissions::Organization { org_id }: permissions::Organization,
     ValidatedJson(data): ValidatedJson<EventTypeUpdate>,
-) -> Result<(StatusCode, Json<EventTypeOut>)> {
-    let evtype = ctx!(
-        eventtype::Entity::secure_find_by_name(org_id.clone(), event_type_name.clone())
-            .one(db)
-            .await
-    )?;
+) -> Result<JsonStatusUpsert<EventTypeOut>> {
+    let evtype = eventtype::Entity::secure_find_by_name(org_id.clone(), event_type_name.clone())
+        .one(db)
+        .await?;
 
     match evtype {
         Some(evtype) => {
             let mut evtype: eventtype::ActiveModel = evtype.into();
             data.update_model(&mut evtype);
-            let ret = ctx!(evtype.update(db).await)?;
+            let ret = evtype.update(db).await.map_err(http_error_on_conflict)?;
 
-            Ok((StatusCode::OK, Json(ret.into())))
+            Ok(JsonStatusUpsert::Updated(ret.into()))
         }
         None => {
-            let ret = ctx!(
-                eventtype::ActiveModel {
-                    org_id: Set(org_id),
-                    name: Set(event_type_name),
-                    ..data.into()
-                }
-                .insert(db)
-                .await
-            )?;
+            let ret = eventtype::ActiveModel {
+                org_id: Set(org_id),
+                name: Set(event_type_name),
+                ..data.into()
+            }
+            .insert(db)
+            .await
+            .map_err(http_error_on_conflict)?;
 
-            Ok((StatusCode::CREATED, Json(ret.into())))
+            Ok(JsonStatusUpsert::Created(ret.into()))
         }
     }
 }
 
-const PATCH_EVENT_TYPE_DESCRIPTION: &str = "Partially update an event type.";
-
+/// Partially update an event type.
+#[aide_annotate]
 async fn patch_event_type(
     State(AppState { ref db, .. }): State<AppState>,
     Path(EventTypeNamePath { event_type_name }): Path<EventTypeNamePath>,
     permissions::Organization { org_id }: permissions::Organization,
     ValidatedJson(data): ValidatedJson<EventTypePatch>,
 ) -> Result<Json<EventTypeOut>> {
-    let evtype = ctx!(
-        eventtype::Entity::secure_find_by_name(org_id, event_type_name)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+    let evtype = eventtype::Entity::secure_find_by_name(org_id, event_type_name)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
 
     let mut evtype: eventtype::ActiveModel = evtype.into();
     data.update_model(&mut evtype);
 
-    let ret = ctx!(evtype.update(db).await)?;
+    let ret = evtype.update(db).await.map_err(http_error_on_conflict)?;
     Ok(Json(ret.into()))
 }
 
-const DELETE_EVENT_TYPE_DESCRIPTION: &str = r#"
-Archive an event type.
+#[derive(Debug, Deserialize, Serialize, Validate, JsonSchema)]
+struct DeleteEventTypeQueryParams {
+    /// By default event types are archived when "deleted". Passing this to `true` deletes them
+    /// entirely.
+    #[serde(default)]
+    expunge: bool,
+}
 
-Endpoints already configured to filter on an event type will continue to do so after archival.
-However, new messages can not be sent with it and endpoints can not filter on it.
-An event type can be unarchived with the
-[create operation](#operation/create_event_type_api_v1_event_type__post).
-"#;
-
+/// Archive an event type.
+///
+/// Endpoints already configured to filter on an event type will continue to do so after archival.
+/// However, new messages can not be sent with it and endpoints can not filter on it.
+/// An event type can be unarchived with the
+/// [create operation](#operation/create_event_type_api_v1_event_type__post).
+#[aide_annotate(op_id = "v1.event-type.delete")]
 async fn delete_event_type(
     State(AppState { ref db, .. }): State<AppState>,
     Path(EventTypeNamePath { event_type_name }): Path<EventTypeNamePath>,
+    ValidatedQuery(DeleteEventTypeQueryParams { expunge }): ValidatedQuery<
+        DeleteEventTypeQueryParams,
+    >,
     permissions::Organization { org_id }: permissions::Organization,
-) -> Result<(StatusCode, Json<EmptyResponse>)> {
-    let evtype = ctx!(
-        eventtype::Entity::secure_find_by_name(org_id, event_type_name)
-            .one(db)
-            .await
-    )?
-    .ok_or_else(|| HttpError::not_found(None, None))?;
+) -> Result<NoContent> {
+    let evtype = eventtype::Entity::secure_find_by_name(org_id, event_type_name)
+        .one(db)
+        .await?
+        .ok_or_else(|| HttpError::not_found(None, None))?;
 
     let mut evtype: eventtype::ActiveModel = evtype.into();
-    evtype.deleted = Set(true);
-    ctx!(evtype.update(db).await)?;
-    Ok((StatusCode::NO_CONTENT, Json(EmptyResponse {})))
+
+    if expunge {
+        evtype.delete(db).await?;
+    } else {
+        evtype.deleted = Set(true);
+        evtype.update(db).await?;
+    }
+    Ok(NoContent)
 }
 
 const GENERATE_SCHEMA_EXAMPLE_DESCRIPTION: &str =
@@ -393,30 +448,21 @@ pub fn router() -> ApiRouter<AppState> {
     let tag = openapi_tag("Event Type");
     ApiRouter::new()
         .api_route_with(
-            "/event-type/",
-            post_with(
-                create_event_type,
-                openapi_desc(CREATE_EVENT_TYPE_DESCRIPTION),
-            )
-            .get_with(list_event_types, openapi_desc(LIST_EVENT_TYPES_DESCRIPTION)),
+            "/event-type",
+            post_with(create_event_type, create_event_type_operation)
+                .get_with(list_event_types, list_event_types_operation),
             &tag,
         )
         .api_route_with(
-            "/event-type/:event_type_name/",
-            get_with(get_event_type, openapi_desc(GET_EVENT_TYPE_DESCRIPTION))
-                .put_with(
-                    update_event_type,
-                    openapi_desc(UPDATE_EVENT_TYPE_DESCRIPTION),
-                )
-                .patch_with(patch_event_type, openapi_desc(PATCH_EVENT_TYPE_DESCRIPTION))
-                .delete_with(
-                    delete_event_type,
-                    openapi_desc(DELETE_EVENT_TYPE_DESCRIPTION),
-                ),
+            "/event-type/:event_type_name",
+            get_with(get_event_type, get_event_type_operation)
+                .put_with(update_event_type, update_event_type_operation)
+                .patch_with(patch_event_type, patch_event_type_operation)
+                .delete_with(delete_event_type, delete_event_type_operation),
             &tag,
         )
         .api_route_with(
-            "/event-type/schema/generate-example/",
+            "/event-type/schema/generate-example",
             post_with(
                 api_not_implemented,
                 openapi_desc(GENERATE_SCHEMA_EXAMPLE_DESCRIPTION),
@@ -428,12 +474,13 @@ pub fn router() -> ApiRouter<AppState> {
 #[cfg(test)]
 mod tests {
 
-    use super::ListFetchOptions;
     use serde_json::json;
+
+    use super::ListFetchQueryParams;
 
     #[test]
     fn test_list_fetch_options_default() {
-        let l: ListFetchOptions = serde_json::from_value(json!({})).unwrap();
+        let l: ListFetchQueryParams = serde_json::from_value(json!({})).unwrap();
         assert!(!l.include_archived);
         assert!(!l.with_content);
     }

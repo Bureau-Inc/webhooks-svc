@@ -1,4 +1,4 @@
-// Deprecated: Please use `AppPortalAccess` instead.
+//go:build ignore
 func (authentication *Authentication) DashboardAccess(
 	ctx context.Context,
 	appId string,

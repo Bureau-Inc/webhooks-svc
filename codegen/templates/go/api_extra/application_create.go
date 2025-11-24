@@ -1,4 +1,4 @@
-// Get or create a new application.
+//go:build ignore
 func (application *Application) GetOrCreate(
 	ctx context.Context,
 	applicationIn models.ApplicationIn,

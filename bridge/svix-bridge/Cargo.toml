@@ -14,7 +14,7 @@ indexmap = { version = "2.10.0", features = ["serde"] }
 itertools = "0.14.0"
 once_cell = "1.18.0"
 opentelemetry = "0.26.0"
-opentelemetry_sdk = { version = "0.26.0", features = ["metrics", "rt-tokio"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.26.0", features = ["metrics", "grpc-tonic", "http-proto", "reqwest-client"] }
 serde.workspace = true
 serde_json.workspace = true

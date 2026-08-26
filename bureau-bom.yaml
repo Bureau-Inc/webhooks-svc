@@ -1,0 +1,5 @@
+go:
+  version: v1
+  modules:
+    - go.mod
+    - go/go.mod
